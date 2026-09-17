@@ -30,7 +30,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.1.1'
+$script:Version  = '1.2.0'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -294,11 +294,38 @@ function Get-Catalog {
         "$la\Google\Chrome\User Data\*\GPUCache",
         "$la\Google\Chrome\User Data\*\Service Worker\CacheStorage"
     ) '低' $true $false))
-    [void]$list.Add((New-Entry 'DevCache' '开发工具缓存' 'pip / npm / yarn / NuGet / Go / Cargo 等包管理器下载缓存' 'DirContent' @(
-        "$la\pip\Cache", "$la\npm-cache", "$ad\npm-cache", "$la\Yarn\Cache",
-        "$la\NuGet\v3-cache", "$la\go-build", "$up\.cache", "$up\.cargo\registry\cache"
+    [void]$list.Add((New-Entry 'DevCache' '开发工具缓存' 'pip / npm / yarn / NuGet / Go / Cargo / Gradle 等包管理器下载缓存' 'DirContent' @(
+        "$la\pip\Cache", "$la\npm-cache", "$ad\npm-cache", "$la\Yarn\Cache", "$la\Yarn\Berry\cache",
+        "$la\NuGet\v3-cache", "$la\NuGet\plugins-cache", "$la\go-build", "$up\.cache", "$up\.cargo\registry\cache",
+        "$up\.gradle\wrapper\dists", "$up\.gradle\daemon"
     ) '低' $true $false))
     [void]$list.Add((New-Entry 'INetCache' '系统网络缓存' 'WinINet / IE 模式网络缓存目录' 'DirContent' @("$la\Microsoft\Windows\INetCache") '低' $true $false))
+    [void]$list.Add((New-Entry 'GpuShaderCache' '显卡着色器缓存' 'DirectX 与 AMD / Intel 显卡的着色器缓存，删除后游戏首次加载略慢' 'DirContent' @(
+        "$la\D3DSCache", "$la\Microsoft\DirectX Shader Cache",
+        "$la\AMD\DxCache", "$la\AMD\GLCache", "$la\Intel\ShaderCache"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'BrowserGpuCache' '浏览器 GPU 着色器缓存' 'Edge / Chrome 的 GPU 着色器缓存，与网页缓存分开存放' 'DirContent' @(
+        "$la\Microsoft\Edge\User Data\ShaderCache",
+        "$la\Microsoft\Edge\User Data\GrShaderCache",
+        "$la\Microsoft\Edge\User Data\GraphiteDawnCache",
+        "$la\Google\Chrome\User Data\ShaderCache",
+        "$la\Google\Chrome\User Data\GrShaderCache",
+        "$la\Google\Chrome\User Data\GraphiteDawnCache"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'WebView2Cache' 'WebView2 应用缓存' 'Office / Teams 等内嵌浏览器组件的网页缓存，删除后首次加载略慢' 'DirContent' @(
+        "$la\Microsoft\EdgeWebView\User Data\*\EBWebView\*\Cache",
+        "$la\Microsoft\EdgeWebView\User Data\*\EBWebView\*\Code Cache",
+        "$la\Microsoft\EdgeWebView\User Data\*\EBWebView\*\GPUCache"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'VSCodeCache' 'VS Code 缓存' 'CachedData、GPU 缓存与启动日志，删除后首次启动略慢' 'DirContent' @(
+        "$ad\Code\Cache", "$ad\Code\CachedData", "$ad\Code\GPUCache",
+        "$ad\Code\Code Cache", "$ad\Code\logs"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'BrowserCrashReport' '浏览器崩溃报告' 'Edge / Chrome 崩溃后留下的报告文件' 'DirContent' @(
+        "$la\Microsoft\Edge\User Data\Crashpad\reports",
+        "$la\Google\Chrome\User Data\Crashpad\reports"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'RdpCache' '远程桌面缓存' '远程桌面连接的位图缓存，删除后首次连接略慢' 'DirContent' @("$la\Microsoft\Terminal Server Client\Cache") '低' $true $false))
 
     # ---------- 中风险 ----------
     [void]$list.Add((New-Entry 'MavenGradle' 'Maven / Gradle 本地仓库' 'Java 依赖本地仓库，删除后下次构建会重新下载（可能很久）' 'DirContent' @("$up\.m2\repository", "$up\.gradle\caches") '中' $false $false))
@@ -315,10 +342,32 @@ function Get-Catalog {
     [void]$list.Add((New-Entry 'PkgCache' '安装包缓存 (Package Cache)' 'VS / VC++ 运行库安装缓存，删除后修复或卸载软件时可能要重下' 'DirContent' @("$pd\Package Cache") '中' $false $true))
     [void]$list.Add((New-Entry 'EventLog' '系统事件日志' '清空事件查看器中的日志内容' 'EventLog' @() '中' $false $true))
     [void]$list.Add((New-Entry 'Dism' 'Windows 组件清理 (DISM)' '清理 WinSxS 中的旧组件，耗时较长，清理后无法回滚已装更新' 'Dism' @() '中' $false $true))
+    [void]$list.Add((New-Entry 'AdobeMediaCache' 'Adobe 媒体缓存' 'Premiere / After Effects 等生成的媒体缓存，删除后需重新生成' 'DirContent' @(
+        "$ad\Adobe\Common\Media Cache",
+        "$ad\Adobe\Common\Media Cache Files",
+        "$ad\Adobe\Common\Peak Files"
+    ) '中' $false $false))
+    [void]$list.Add((New-Entry 'UwpCache' '商店应用缓存' '商店 / UWP 应用的本地缓存与临时状态，个别应用会把设置放这里' 'DirContent' @(
+        "$la\Packages\*\LocalCache",
+        "$la\Packages\*\AC\Temp",
+        "$la\Packages\*\TempState"
+    ) '中' $false $false))
+    [void]$list.Add((New-Entry 'OfficeCache' 'Office 缓存' 'Office 文档缓存与协作漫游缓存，删除后首次打开文档略慢' 'DirContent' @(
+        "$la\Microsoft\Office\16.0\OfficeFileCache",
+        "$la\Microsoft\Office\16.0\Wef"
+    ) '中' $false $false))
+    [void]$list.Add((New-Entry 'IdeCache' 'IDE 索引缓存' 'JetBrains / Visual Studio 的索引缓存，删除后需重新索引项目' 'DirContent' @(
+        "$la\JetBrains\*\caches",
+        "$la\Microsoft\VisualStudio\*\ComponentModelCache"
+    ) '中' $false $false))
+    [void]$list.Add((New-Entry 'SystemLogExtra' '系统组件日志与缓存' '系统组件与 ETW / WMI 追踪日志、系统图标缓存' 'DirContent' @(
+        "$win\System32\LogFiles",
+        "$pd\Microsoft\Windows\Caches"
+    ) '中' $false $true))
 
     # ---------- 高风险 ----------
     [void]$list.Add((New-Entry 'MemoryDump' '内存转储文件' 'C:\MEMORY.DMP 与 Minidump，排查蓝屏用' 'RemoveDir' @("$sd\MEMORY.DMP", "$win\Minidump") '高' $false $true))
-    [void]$list.Add((New-Entry 'UpgradeLeftover' '系统升级残留目录' '$WINDOWS.~BT / $WINDOWS.~WS 升级临时目录' 'RemoveDir' @("$sd\`$WINDOWS.~BT", "$sd\`$WINDOWS.~WS") '高' $false $true))
+    [void]$list.Add((New-Entry 'UpgradeLeftover' '系统升级残留目录' '$WINDOWS.~BT / $WINDOWS.~WS 升级临时目录，以及 $WinREAgent / $GetCurrent / Panther 安装残留' 'RemoveDir' @("$sd\`$WINDOWS.~BT", "$sd\`$WINDOWS.~WS", "$sd\`$WinREAgent", "$sd\`$GetCurrent", "$win\Panther") '高' $false $true))
     [void]$list.Add((New-Entry 'WindowsOld' 'Windows.old' '系统升级前的旧系统备份，删除后无法回退到旧版本' 'RemoveDir' @("$sd\Windows.old") '高' $false $true))
     [void]$list.Add((New-Entry 'Hibernate' '休眠文件 (hiberfil.sys)' '关闭休眠并删除休眠文件，会同时关闭「快速启动」功能' 'Hibernate' @() '高' $false $true))
 

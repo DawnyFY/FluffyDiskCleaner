@@ -1,0 +1,11 @@
+# 运行时生成的用户配置（含本机勾选状态，不应提交）
+cleaner.config.json
+
+# 分发包与调试产物
+*.zip
+*.png
+*.log
+
+# 系统文件
+Thumbs.db
+desktop.ini

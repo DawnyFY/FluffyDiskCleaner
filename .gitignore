@@ -6,6 +6,9 @@ cleaner.config.json
 *.png
 *.log
 
+# 按版本号保存的未压缩发行副本（如 v1.2.0/）
+/v*.*.*/
+
 # 系统文件
 Thumbs.db
 desktop.ini

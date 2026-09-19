@@ -30,7 +30,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.2.2'
+$script:Version  = '1.2.3'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -945,6 +945,10 @@ function Show-MxDialog {
         [switch]$CenterScreen
     )
 
+    # WinForms 的多行 TextBox 由系统原生控件绘制，只把 \r\n 当换行，脚本里常见的纯 \n
+    # 会被直接忽略，正文就会挤成一行。这里统一规范为 \r\n（先清掉 \r 再补，避免出现 \r\r\n）。
+    $Message = ($Message -replace "`r", '') -replace "`n", "`r`n"
+
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.FormBorderStyle = 'None'
     $dlg.StartPosition = 'CenterParent'
@@ -1070,22 +1074,31 @@ $script:DisclaimerText = @'
 本工具会永久删除文件，删除后不进入回收站，也无法通过常规手段恢复。请先完整阅读以下条款，点击「我已阅读并同意」后方可继续使用。
 
 一、工具性质
+
 本工具为个人开发并免费公开的技术实践项目，不构成商业软件或专业服务，也非微软官方产品或经其认证的组件。本工具按「现状」（AS IS）提供，不附带任何明示或默示担保。
 
 二、风险告知
+
 1. 本工具执行的是永久删除，被删除的文件无法通过常规手段恢复。
+
 2. 部分清理项具有不可逆的系统级影响：清空回收站会丢失其中待恢复的文件；删除 Windows.old 与系统升级残留后无法回退到升级前的系统版本；删除休眠文件会同时关闭「快速启动」；执行 Windows 组件清理 (DISM) 后无法回滚已安装的更新；清空系统事件日志后，原有记录无法再用于事后排查。
+
 3. 部分清理项会导致第三方软件需要重新下载依赖、重新构建或重新安装。
 
 三、使用者的责任
+
 1. 你应在执行清理前自行确认勾选项，并对将要删除的内容有充分了解。
+
 2. 你应自行对重要数据做好备份，建议首次使用前创建完整备份或系统还原点。
+
 3. 是否以管理员权限运行、是否启用启动时自动清理，均由你自主决定。
 
 四、免责条款
+
 在法律允许的最大范围内，作者不对使用或无法使用本工具所导致的任何直接、间接、附带或后果性损失承担责任，包括但不限于数据丢失、文件损坏、系统无法启动、业务中断及数据恢复费用；亦不对因误勾选、自行修改源码、用于违规用途、系统或硬件环境差异、以及第三方二次分发等情形造成的损失负责。
 
 五、其他
+
 本声明为 MIT 许可证的补充说明；若本声明与许可证条款就责任限制事项存在冲突，以对作者责任限制更严格者为准。
 
 完整条款见程序同目录的 DISCLAIMER.md。若你不同意上述任何内容，请选择「不同意并退出」，并删除本工具及其全部副本。

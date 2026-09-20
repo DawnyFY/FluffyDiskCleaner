@@ -30,12 +30,11 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.2.3'
+$script:Version  = '1.3.0'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
 $script:Entries  = New-Object System.Collections.ArrayList
-$script:Suppress = $false
 $script:DisclaimerAccepted = $false   # 是否已同意免责声明，未同意前不进入主界面
 
 # ======================= 基础工具函数 =======================
@@ -570,20 +569,13 @@ $script:Mx = @{
     Primary                   = '#FF3482FF'
     PrimaryHover              = '#FF2C74E8'
     OnPrimary                 = '#FFFFFFFF'
-    PrimaryContainer          = '#FF5D9BFF'
     Secondary                 = '#FFE6E6E6'
     SecondaryVariant          = '#FFF0F0F0'
     OnSecondaryVariant        = '#FF303030'
-    TertiaryContainer         = '#FFEAF2FF'
-    OnTertiaryContainer       = '#FF3482FF'
-    Background                = '#FFFFFFFF'
     OnBackground              = '#FF000000'
-    OnBackgroundVariant       = '#FF8C93B0'
     Surface                   = '#FFF7F7F7'
     SurfaceVariant            = '#FFFFFFFF'
     OnSurfaceSecondary        = '#CC000000'
-    OnSurfaceVariantSummary   = '#99000000'
-    OnSurfaceVariantActions   = '#66000000'
     SurfaceContainer          = '#FFFFFFFF'
     OnSurfaceContainerVariant = '#FF959595'
     SurfaceContainerHigh      = '#FFE8E8E8'
@@ -599,6 +591,10 @@ $script:Mx = @{
     ChipMidBg                 = '#FFFCF3E3'
     ChipHighFg                = '#FFE94634'
     ChipHighBg                = '#FFFCEFED'
+    ChartCleanSel             = '#FF3482FF'
+    ChartClean                = '#FFA6C6FF'
+    ChartUsed                 = '#FFB9C4D6'
+    ChartFree                 = '#FFE8EDF5'
 }
 
 $script:MxRadius = 16
@@ -932,6 +928,50 @@ function New-MxCaptionButton {
     return $b
 }
 
+# ---------- 环形图 ----------
+
+# 画一个环形图（甜甜圈）：
+#   先用 FillPie 依次铺满外圆形成各扇形，再用卡片底色 FillEllipse 挖出中心，得到圆环。
+#   比逐段拼接圆环路径简单，也不会有相邻弧线之间的接缝毛刺。
+# 所有尺寸与颜色都从参数传入，绘制期不产生新的画刷对象（颜色统一走 Get-MxBrush 缓存）。
+function Draw-MxDonut {
+    param(
+        [System.Drawing.Graphics]$Graphics,
+        [double]$Cx, [double]$Cy,
+        [double]$OuterR, [double]$InnerR,
+        [double[]]$Values,
+        [string[]]$Colors,
+        [System.Drawing.Color]$BackColor
+    )
+
+    # 坐标一律用数值重载：FillPie 若传 RectangleF，PowerShell 会误选
+    # FillPie(Brush, Rectangle, float, float) 并抛出类型转换异常。
+    $ox = $Cx - $OuterR
+    $oy = $Cy - $OuterR
+    $od = $OuterR * 2
+
+    $total = [double]0
+    foreach ($v in $Values) { if ($v -gt 0) { $total += [double]$v } }
+
+    if ($total -le 0) {
+        # 没有任何数据时画一个完整的浅色圆环，避免出现空洞
+        $Graphics.FillEllipse((Get-MxBrush (Get-MxColor $script:Mx.ChartUsed)), $ox, $oy, $od, $od)
+    } else {
+        $start = -90.0   # 从 12 点方向开始，顺时针铺开
+        for ($i = 0; $i -lt $Values.Count; $i++) {
+            $v = [double]$Values[$i]
+            if ($v -le 0) { continue }
+            $sweep = 360.0 * $v / $total
+            if ($sweep -le 0) { continue }
+            $Graphics.FillPie((Get-MxBrush (Get-MxColor $Colors[$i])), $ox, $oy, $od, $od, $start, $sweep)
+            $start += $sweep
+        }
+    }
+
+    # 挖中心形成圆环
+    $Graphics.FillEllipse((Get-MxBrush $BackColor), ($Cx - $InnerR), ($Cy - $InnerR), ($InnerR * 2), ($InnerR * 2))
+}
+
 # ---------- 对话框 ----------
 
 function Show-MxDialog {
@@ -1152,12 +1192,18 @@ function Show-Gui {
     }
 
     # ---- 布局常量（逻辑单位 → 像素）----
-    $W       = MxU 880
+    # 双栏结构：左栏放磁盘环形图 / 自动清理 / 风险统计，右栏放工具条与清理项列表，
+    # 运行日志通栏置于底部。列表可视行数由 6 行提升到 8 行。
+    $W       = MxU 1180
     $PAD     = MxU 20
-    $CARDW   = $W - $PAD * 2
     $PAGEH   = MxU 828
+    $COL_LX  = $PAD
+    $COL_LW  = MxU 372
+    $COL_GAP = MxU 16
+    $COL_RX  = $COL_LX + $COL_LW + $COL_GAP
+    $COL_RW  = $W - $PAD - $COL_RX
     $ROW_H   = MxU 58
-    $LIST_H  = MxU 352
+    $LIST_H  = MxU 526
     $LIST_PAD = MxU 8
     $SW_W    = MxU 46
     $SW_H    = MxU 26
@@ -1260,93 +1306,138 @@ function Show-Gui {
     $lblApp.add_MouseDown($dragStart);   $lblApp.add_MouseMove($dragMove);   $lblApp.add_MouseUp($dragEnd)
     $lblVer.add_MouseDown($dragStart);   $lblVer.add_MouseMove($dragMove);   $lblVer.add_MouseUp($dragEnd)
 
-    # ---- 磁盘卡片 ----
-    $cardDisk = New-MxCard -X $PAD -Y (MxU 64) -W $CARDW -H (MxU 100)
+    # ---- 磁盘空间卡片（左栏，环形图）----
+    # 四段构成：已勾选可释放 / 可清理未勾选 / 其他已用 / 可用空间。
+    # 前两段让「可清理」与「本次会释放多少」一眼可辨。
+    $cardDisk = New-MxCard -X $COL_LX -Y (MxU 64) -W $COL_LW -H (MxU 392)
     $root.Controls.Add($cardDisk)
 
-    $lblDiskTitle = New-Object System.Windows.Forms.Label
-    $lblDiskTitle.Text = '系统盘 ' + $env:SystemDrive
-    $lblDiskTitle.Font = $script:FHead
-    $lblDiskTitle.ForeColor = (Get-MxColor $script:Mx.OnBackground)
-    $lblDiskTitle.BackColor = [System.Drawing.Color]::Transparent
-    $lblDiskTitle.Location = New-Object System.Drawing.Point((MxU 24), (MxU 20))
-    $lblDiskTitle.Size = New-Object System.Drawing.Size((MxU 400), (MxU 22))
-    $cardDisk.Controls.Add($lblDiskTitle)
+    # 图表数据由 Update-MxDisk / Update-MxSummary 写入，绘制期只读
+    $script:MxChart = @{
+        Total = [double]0; Used = [double]0; Free = [double]0
+        CleanAll = [double]0; CleanSel = [double]0
+        Unsel = [double]0; OtherUsed = [double]0
+        Items = 0; SelCount = 0
+        TotalText = '共 0 B'
+        Lg1 = '已勾选可释放   0 B'; Lg2 = '可清理未勾选   0 B'
+        Lg3 = '其他已用       0 B'; Lg4 = '可用空间       0 B'
+        P1 = '0.0%'; P2 = '0.0%'; P3 = '0.0%'; P4 = '0.0%'
+        LowText = '低 0 项  0 B'; MidText = '中 0 项  0 B'; HighText = '高 0 项  0 B'
+    }
 
-    $lblDiskFree = New-Object System.Windows.Forms.Label
-    $lblDiskFree.Font = $script:FHead
-    $lblDiskFree.ForeColor = (Get-MxColor $script:Mx.OnTertiaryContainer)
-    $lblDiskFree.BackColor = [System.Drawing.Color]::Transparent
-    $lblDiskFree.TextAlign = 'MiddleRight'
-    $lblDiskFree.Location = New-Object System.Drawing.Point(($CARDW - (MxU 24) - (MxU 300)), (MxU 20))
-    $lblDiskFree.Size = New-Object System.Drawing.Size((MxU 300), (MxU 22))
-    $cardDisk.Controls.Add($lblDiskFree)
-
-    $script:MxUsedPct = 0
-    $barDisk = New-Object System.Windows.Forms.Panel
-    $barDisk.Location = New-Object System.Drawing.Point((MxU 24), (MxU 52))
-    $barDisk.Size = New-Object System.Drawing.Size(($CARDW - (MxU 48)), (MxU 10))
-    $barDisk.BackColor = (Get-MxColor $script:Mx.SurfaceVariant)
-    Enable-DoubleBuffer $barDisk
-    $barDisk.add_Paint({
+    $chartPanel = New-Object System.Windows.Forms.Panel
+    $chartPanel.Dock = 'Fill'
+    $chartPanel.BackColor = (Get-MxColor $script:Mx.SurfaceVariant)
+    Enable-DoubleBuffer $chartPanel
+    $chartPanel.add_Paint({
         param($sender, $e)
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
         $g.Clear($sender.BackColor)
-        $h = $sender.Height
-        $r = New-Object System.Drawing.RectangleF(0, 0, $sender.Width, $h)
-        $p = New-RoundedPath -Rect $r -Radius ($h / 2)
-        $g.FillPath((Get-MxBrush (Get-MxColor $script:Mx.SurfaceContainerHigh)), $p)
-        $p.Dispose()
-        $pct = [double]$script:MxUsedPct
-        if ($pct -gt 0) {
-            $fw = $sender.Width * $pct / 100.0
-            if ($fw -lt $h) { $fw = $h }
-            $r2 = New-Object System.Drawing.RectangleF(0, 0, $fw, $h)
-            $p2 = New-RoundedPath -Rect $r2 -Radius ($h / 2)
-            $g.FillPath((Get-MxBrush (Get-MxColor $script:Mx.Primary)), $p2)
-            $p2.Dispose()
+
+        $c  = $script:MxChart
+        $cw = $sender.Width
+        $px = MxU 24
+
+        $brTitle = Get-MxBrush (Get-MxColor $script:Mx.OnBackground)
+        $brMuted = Get-MxBrush (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
+        $brBody  = Get-MxBrush (Get-MxColor $script:Mx.OnSurfaceSecondary)
+
+        # 标题行
+        $g.DrawString('磁盘空间', $script:FHead, $brTitle, $px, (MxU 18))
+        $g.DrawString($c.TotalText, $script:FFoot, $brMuted,
+            (New-Object System.Drawing.RectangleF($px, (MxU 22), ($cw - $px * 2), (MxU 18))), $script:MxSfFar)
+
+        # 环形图
+        $cx   = $cw / 2.0
+        $cy   = MxUF 158
+        $rOut = MxUF 88
+        $rIn  = MxUF 60
+        Draw-MxDonut -Graphics $g -Cx $cx -Cy $cy -OuterR $rOut -InnerR $rIn `
+                     -Values @($c.CleanSel, $c.Unsel, $c.OtherUsed, $c.Free) `
+                     -Colors @($script:Mx.ChartCleanSel, $script:Mx.ChartClean, $script:Mx.ChartUsed, $script:Mx.ChartFree) `
+                     -BackColor $sender.BackColor
+
+        # 环心文字
+        $holeW = $rIn * 2
+        $g.DrawString('可清理合计', $script:FCap, $brMuted,
+            (New-Object System.Drawing.RectangleF(($cx - $rIn), ($cy - (MxU 19)), $holeW, (MxU 16))), $script:MxSfCenter)
+        $g.DrawString((Format-Size $c.CleanAll), $script:FHead, (Get-MxBrush (Get-MxColor $script:Mx.Primary)),
+            (New-Object System.Drawing.RectangleF(($cx - $rIn), ($cy + (MxU 1)), $holeW, (MxU 24))), $script:MxSfCenter)
+
+        # 图例
+        $legends = @(
+            @($script:Mx.ChartCleanSel, $c.Lg1, $c.P1),
+            @($script:Mx.ChartClean,    $c.Lg2, $c.P2),
+            @($script:Mx.ChartUsed,     $c.Lg3, $c.P3),
+            @($script:Mx.ChartFree,     $c.Lg4, $c.P4)
+        )
+        $ly = MxUF 264
+        foreach ($lg in $legends) {
+            $dr = New-Object System.Drawing.RectangleF($px, ($ly + (MxU 4)), (MxU 10), (MxU 10))
+            $dp = New-RoundedPath -Rect $dr -Radius (MxU 5)
+            $g.FillPath((Get-MxBrush (Get-MxColor $lg[0])), $dp)
+            $dp.Dispose()
+            $g.DrawString($lg[1], $script:FFoot, $brBody, ($px + (MxU 18)), $ly)
+            $g.DrawString($lg[2], $script:FFoot, $brMuted,
+                (New-Object System.Drawing.RectangleF($px, $ly, ($cw - $px * 2), (MxU 16))), $script:MxSfFar)
+            $ly += MxUF 29
         }
     })
-    $cardDisk.Controls.Add($barDisk)
 
-    $lblDiskDetail = New-Object System.Windows.Forms.Label
-    $lblDiskDetail.Font = $script:FFoot
-    $lblDiskDetail.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
-    $lblDiskDetail.BackColor = [System.Drawing.Color]::Transparent
-    $lblDiskDetail.Location = New-Object System.Drawing.Point((MxU 24), (MxU 70))
-    $lblDiskDetail.Size = New-Object System.Drawing.Size(($CARDW - (MxU 48)), (MxU 18))
-    $cardDisk.Controls.Add($lblDiskDetail)
+    $cardDisk.Controls.Add($chartPanel)
 
-    # ---- 工具条 ----
-    $tbY = MxU 176
+    # ---- 工具条（右栏顶部）----
+    $tbY = MxU 64
     $btnRescan = New-MxButton -Text '重新扫描'   -Width (MxU 100) -Height (MxU 34) -Kind 'Secondary'
-    $btnRescan.Location = New-Object System.Drawing.Point($PAD, $tbY)
+    $btnRescan.Location = New-Object System.Drawing.Point($COL_RX, $tbY)
     $root.Controls.Add($btnRescan)
 
     $btnLow = New-MxButton -Text '只选低风险' -Width (MxU 108) -Height (MxU 34) -Kind 'Secondary'
-    $btnLow.Location = New-Object System.Drawing.Point(($PAD + (MxU 112)), $tbY)
+    $btnLow.Location = New-Object System.Drawing.Point(($COL_RX + (MxU 112)), $tbY)
     $root.Controls.Add($btnLow)
 
     $btnAll = New-MxButton -Text '全选'       -Width (MxU 76) -Height (MxU 34) -Kind 'Secondary'
-    $btnAll.Location = New-Object System.Drawing.Point(($PAD + (MxU 232)), $tbY)
+    $btnAll.Location = New-Object System.Drawing.Point(($COL_RX + (MxU 232)), $tbY)
     $root.Controls.Add($btnAll)
 
     $btnNone = New-MxButton -Text '全不选'    -Width (MxU 88) -Height (MxU 34) -Kind 'Secondary'
-    $btnNone.Location = New-Object System.Drawing.Point(($PAD + (MxU 320)), $tbY)
+    $btnNone.Location = New-Object System.Drawing.Point(($COL_RX + (MxU 320)), $tbY)
     $root.Controls.Add($btnNone)
 
     $btnHelp = New-MxButton -Text '使用说明'  -Width (MxU 100) -Height (MxU 34) -Kind 'Text'
     $btnHelp.Location = New-Object System.Drawing.Point(($W - $PAD - (MxU 100)), $tbY)
     $root.Controls.Add($btnHelp)
 
-    # ---- 列表卡片（整块自绘 + 行级局部刷新）----
-    $cardList = New-MxCard -X $PAD -Y (MxU 222) -W $CARDW -H $LIST_H
+    # ---- 列表卡片（右栏，整块自绘 + 行级局部刷新）----
+    $cardList = New-MxCard -X $COL_RX -Y (MxU 114) -W $COL_RW -H $LIST_H
     $root.Controls.Add($cardList)
 
+    $lblListTitle = New-Object System.Windows.Forms.Label
+    $lblListTitle.Text = '清理项'
+    $lblListTitle.Font = $script:FHead
+    $lblListTitle.ForeColor = (Get-MxColor $script:Mx.OnBackground)
+    $lblListTitle.BackColor = [System.Drawing.Color]::Transparent
+    $lblListTitle.Location = New-Object System.Drawing.Point((MxU 24), (MxU 14))
+    $lblListTitle.Size = New-Object System.Drawing.Size((MxU 200), (MxU 22))
+    $cardList.Controls.Add($lblListTitle)
+
+    # 右上角展示扫描结果摘要（项数 / 耗时），与底部「已选」状态互补而非重复
+    $lblListMeta = New-Object System.Windows.Forms.Label
+    $lblListMeta.Font = $script:FFoot
+    $lblListMeta.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
+    $lblListMeta.BackColor = [System.Drawing.Color]::Transparent
+    $lblListMeta.TextAlign = 'MiddleRight'
+    $lblListMeta.Location = New-Object System.Drawing.Point(($COL_RW - (MxU 24) - (MxU 320)), (MxU 16))
+    $lblListMeta.Size = New-Object System.Drawing.Size((MxU 320), (MxU 18))
+    $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项')
+    $cardList.Controls.Add($lblListMeta)
+
+    $LIST_TOP = MxU 46
     $listView = New-Object System.Windows.Forms.Panel
-    $listView.Location = New-Object System.Drawing.Point($LIST_PAD, $LIST_PAD)
-    $listView.Size = New-Object System.Drawing.Size(($CARDW - $LIST_PAD * 2), ($LIST_H - $LIST_PAD * 2))
+    $listView.Location = New-Object System.Drawing.Point($LIST_PAD, $LIST_TOP)
+    $listView.Size = New-Object System.Drawing.Size(($COL_RW - $LIST_PAD * 2), ($LIST_H - $LIST_TOP - $LIST_PAD))
     $listView.BackColor = (Get-MxColor $script:Mx.SurfaceVariant)
     $listView.Cursor = 'Default'
     $listView.TabStop = $true
@@ -1549,8 +1640,8 @@ function Show-Gui {
     $root.add_MouseWheel($wheel)
     $form.add_MouseWheel($wheel)
 
-    # ---- 自动清理开关卡片 ----
-    $cardAuto = New-MxCard -X $PAD -Y (MxU 586) -W $CARDW -H (MxU 62)
+    # ---- 自动清理开关卡片（左栏）----
+    $cardAuto = New-MxCard -X $COL_LX -Y (MxU 472) -W $COL_LW -H (MxU 76)
     $cardAuto.Cursor = 'Hand'
     $root.Controls.Add($cardAuto)
     $cardAuto.add_Paint({
@@ -1559,10 +1650,10 @@ function Show-Gui {
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
         $g.Clear($sender.BackColor)
-        $g.DrawString('启动时自动清理', $script:FBody, (Get-MxBrush (Get-MxColor $script:Mx.OnBackground)), (MxU 24), (MxU 13))
-        $g.DrawString('下次打开程序按本次勾选自动执行，5 秒倒计时内可中止', $script:FCap, (Get-MxBrush (Get-MxColor $script:Mx.OnSurfaceContainerVariant)), (MxU 24), (MxU 35))
-        $swX = $CARDW - (MxU 24) - $SW_W
-        $swY = (MxU 62 - 26) / 2
+        $g.DrawString('启动时自动清理', $script:FBody, (Get-MxBrush (Get-MxColor $script:Mx.OnBackground)), (MxU 24), (MxU 18))
+        $g.DrawString('下次打开按本次勾选自动执行，5 秒内可中止', $script:FCap, (Get-MxBrush (Get-MxColor $script:Mx.OnSurfaceContainerVariant)), (MxU 24), (MxU 42))
+        $swX = $COL_LW - (MxU 24) - $SW_W
+        $swY = (MxU 76 - 26) / 2
         $tr = New-Object System.Drawing.RectangleF($swX, $swY, $SW_W, $SW_H)
         $tp = New-RoundedPath -Rect $tr -Radius ($SW_H / 2)
         $tc = Get-MxColor $script:Mx.SurfaceContainerHigh
@@ -1584,13 +1675,39 @@ function Show-Gui {
         $sender.Invalidate()
     })
 
-    # ---- 日志卡片 ----
-    $cardLog = New-MxCard -X $PAD -Y (MxU 660) -W $CARDW -H (MxU 100)
+    # ---- 风险分级统计卡片（左栏）----
+    # 与环形图共用同一份统计数据，勾选变化后由 Update-MxSummary 一并刷新
+    $cardRisk = New-MxCard -X $COL_LX -Y (MxU 564) -W $COL_LW -H (MxU 76)
+    $root.Controls.Add($cardRisk)
+    $cardRisk.add_Paint({
+        param($sender, $e)
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+        $g.Clear($sender.BackColor)
+        $c = $script:MxChart
+        $g.DrawString('风险分级', $script:FBody, (Get-MxBrush (Get-MxColor $script:Mx.OnBackground)), (MxU 24), (MxU 12))
+        $g.DrawString($c.LowText,  $script:FCap, (Get-MxBrush (Get-MxColor $script:Mx.ChipLowFg)),  (MxU 24),  (MxU 44))
+        $g.DrawString($c.MidText,  $script:FCap, (Get-MxBrush (Get-MxColor $script:Mx.ChipMidFg)),  (MxU 140), (MxU 44))
+        $g.DrawString($c.HighText, $script:FCap, (Get-MxBrush (Get-MxColor $script:Mx.ChipHighFg)), (MxU 256), (MxU 44))
+    })
+
+    # ---- 日志卡片（底部通栏）----
+    $cardLog = New-MxCard -X $COL_LX -Y (MxU 656) -W ($W - $PAD * 2) -H (MxU 92)
     $root.Controls.Add($cardLog)
 
+    $lblLogTitle = New-Object System.Windows.Forms.Label
+    $lblLogTitle.Text = '运行日志'
+    $lblLogTitle.Font = $script:FCap
+    $lblLogTitle.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
+    $lblLogTitle.BackColor = [System.Drawing.Color]::Transparent
+    $lblLogTitle.Location = New-Object System.Drawing.Point((MxU 16), (MxU 8))
+    $lblLogTitle.Size = New-Object System.Drawing.Size((MxU 200), (MxU 14))
+    $cardLog.Controls.Add($lblLogTitle)
+
     $txtLog = New-Object System.Windows.Forms.TextBox
-    $txtLog.Location = New-Object System.Drawing.Point((MxU 16), (MxU 12))
-    $txtLog.Size = New-Object System.Drawing.Size(($CARDW - (MxU 32)), (MxU 76))
+    $txtLog.Location = New-Object System.Drawing.Point((MxU 14), (MxU 26))
+    $txtLog.Size = New-Object System.Drawing.Size((($W - $PAD * 2) - (MxU 28)), (MxU 56))
     $txtLog.Multiline = $true
     $txtLog.ScrollBars = 'Vertical'
     $txtLog.ReadOnly = $true
@@ -1607,36 +1724,84 @@ function Show-Gui {
     $lblStatus.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
     $lblStatus.BackColor = [System.Drawing.Color]::Transparent
     $lblStatus.TextAlign = 'MiddleRight'
-    $lblStatus.Location = New-Object System.Drawing.Point((MxU 352), (MxU 772))
+    $lblStatus.Location = New-Object System.Drawing.Point((MxU 352), (MxU 764))
     $lblStatus.Size = New-Object System.Drawing.Size(($W - (MxU 352) - $PAD), (MxU 44))
     $root.Controls.Add($lblStatus)
 
     $btnClean = New-MxButton -Text '开始清理' -Width (MxU 200) -Height (MxU 44) -Kind 'Primary'
-    $btnClean.Location = New-Object System.Drawing.Point($PAD, (MxU 772))
+    $btnClean.Location = New-Object System.Drawing.Point($PAD, (MxU 764))
     $root.Controls.Add($btnClean)
 
     $btnExit = New-MxButton -Text '退出' -Width (MxU 100) -Height (MxU 44) -Kind 'Secondary'
-    $btnExit.Location = New-Object System.Drawing.Point(($PAD + (MxU 212)), (MxU 772))
+    $btnExit.Location = New-Object System.Drawing.Point(($PAD + (MxU 212)), (MxU 764))
     $btnExit.add_MouseUp({ param($sender, $e) $script:Abort = $true; if (-not $script:Cleaning) { $form.Close() } })
     $root.Controls.Add($btnExit)
 
     # ---- 刷新函数 ----
+    # 环形图与图例的所有派生文本都在这里算好，绘制期只做画图，避免每帧拼接字符串
+    function Update-MxChart {
+        $c = $script:MxChart
+        # 从哈希表取出的是 object，直接传给 [Math]::Max 会被按 Int32 重载绑定，
+        # 遇到百 GB 级的字节数就溢出报错，因此这里显式转 double 再比较
+        $otherUsed = [double]$c.Used - [double]$c.CleanAll
+        if ($otherUsed -lt 0) { $otherUsed = [double]0 }
+        $unsel = [double]$c.CleanAll - [double]$c.CleanSel
+        if ($unsel -lt 0) { $unsel = [double]0 }
+        $c.OtherUsed = $otherUsed
+        $c.Unsel     = $unsel
+        # 百分比与扇形使用同一分母，避免「可清理 > 已用」被截断时
+        # 图形角度与图例数字对不上（正常情况下该分母就等于磁盘总容量）
+        $denom = [double]$c.CleanSel + $unsel + $otherUsed + [double]$c.Free
+        if ($denom -le 0) { $denom = 1 }
+        $c.TotalText = ('共 ' + (Format-Size $c.Total))
+        $c.Lg1 = '已勾选可释放   ' + (Format-Size $c.CleanSel)
+        $c.Lg2 = '可清理未勾选   ' + (Format-Size $unsel)
+        $c.Lg3 = '其他已用       ' + (Format-Size $otherUsed)
+        $c.Lg4 = '可用空间       ' + (Format-Size $c.Free)
+        $c.P1 = ('{0:N1}%' -f ([double]$c.CleanSel / $denom * 100))
+        $c.P2 = ('{0:N1}%' -f ($unsel / $denom * 100))
+        $c.P3 = ('{0:N1}%' -f ($otherUsed / $denom * 100))
+        $c.P4 = ('{0:N1}%' -f ([double]$c.Free / $denom * 100))
+        $chartPanel.Invalidate()
+    }
+
     function Update-MxDisk {
         $d = Get-DiskInfo
         if (-not $d) { return }
-        $pct = 0
-        if ($d.Total -gt 0) { $pct = [math]::Round($d.Used / $d.Total * 100, 1) }
-        $script:MxUsedPct = $pct
-        $lblDiskFree.Text = ('可用 ' + (Format-Size $d.Free))
-        $lblDiskDetail.Text = ('已用 ' + (Format-Size $d.Used) + ' / ' + (Format-Size $d.Total) + '  ·  ' + $pct + '%')
-        $barDisk.Invalidate()
+        $script:MxChart.Total = $d.Total
+        $script:MxChart.Used  = $d.Used
+        $script:MxChart.Free  = $d.Free
+        Update-MxChart
     }
 
     function Update-MxSummary {
         $sel = @($script:Entries | Where-Object { $_.Selected })
         $sum = [double]0
         foreach ($e in $sel) { $sum += $e.Size }
+
+        $all = [double]0
+        $lowN = 0;  $lowS  = [double]0
+        $midN = 0;  $midS  = [double]0
+        $highN = 0; $highS = [double]0
+        foreach ($e in $script:Entries) {
+            $all += $e.Size
+            if ($e.Risk -eq '低')     { $lowN++;  $lowS  += $e.Size }
+            elseif ($e.Risk -eq '中') { $midN++;  $midS  += $e.Size }
+            else                      { $highN++; $highS += $e.Size }
+        }
+
+        $c = $script:MxChart
+        $c.CleanSel = $sum
+        $c.CleanAll = $all
+        $c.SelCount = $sel.Count
+        $c.Items    = $script:Entries.Count
+        $c.LowText  = ('低 ' + $lowN + ' 项 ' + (Format-Size $lowS))
+        $c.MidText  = ('中 ' + $midN + ' 项 ' + (Format-Size $midS))
+        $c.HighText = ('高 ' + $highN + ' 项 ' + (Format-Size $highS))
+
         $lblStatus.Text = ('已选 ' + $sel.Count + ' / ' + $script:Entries.Count + ' 项，预计可释放 ' + (Format-Size $sum))
+        $cardRisk.Invalidate()
+        Update-MxChart
     }
 
     # ---- 昂贵项目的后台测量 ----
@@ -1746,6 +1911,7 @@ function Show-Gui {
         Update-MxSummary
         $note = ''
         if ($deferred -gt 0) { $note = '，另有 ' + $deferred + ' 项在后台计算' }
+        $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项  ·  扫描 ' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒')
         Write-Log ('扫描完成：' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒' + $note)
     }
 
@@ -1898,10 +2064,11 @@ function Show-Gui {
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 120
         }
-        $barDisk.Invalidate(); $listView.Invalidate(); $cardAuto.Invalidate(); $root.Invalidate()
+        $chartPanel.Invalidate(); $listView.Invalidate(); $cardAuto.Invalidate(); $cardRisk.Invalidate(); $root.Invalidate()
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 300
         [System.Windows.Forms.Application]::DoEvents()
+
         $bmpOut = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
         $form.DrawToBitmap($bmpOut, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
         $bmpOut.Save($script:RenderTo, [System.Drawing.Imaging.ImageFormat]::Png)

@@ -30,7 +30,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.3.0'
+$script:Version  = '1.3.2'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -595,6 +595,7 @@ $script:Mx = @{
     ChartClean                = '#FFA6C6FF'
     ChartUsed                 = '#FFB9C4D6'
     ChartFree                 = '#FFE8EDF5'
+    ChartLeader               = '#FF8C93B0'
 }
 
 $script:MxRadius = 16
@@ -941,35 +942,139 @@ function Draw-MxDonut {
         [double]$OuterR, [double]$InnerR,
         [double[]]$Values,
         [string[]]$Colors,
-        [System.Drawing.Color]$BackColor
+        [System.Drawing.Color]$BackColor,
+        [double[]]$Grows = $null,
+        [int]$Emphasize = -1
     )
-
-    # 坐标一律用数值重载：FillPie 若传 RectangleF，PowerShell 会误选
-    # FillPie(Brush, Rectangle, float, float) 并抛出类型转换异常。
-    $ox = $Cx - $OuterR
-    $oy = $Cy - $OuterR
-    $od = $OuterR * 2
 
     $total = [double]0
     foreach ($v in $Values) { if ($v -gt 0) { $total += [double]$v } }
 
     if ($total -le 0) {
         # 没有任何数据时画一个完整的浅色圆环，避免出现空洞
-        $Graphics.FillEllipse((Get-MxBrush (Get-MxColor $script:Mx.ChartUsed)), $ox, $oy, $od, $od)
-    } else {
-        $start = -90.0   # 从 12 点方向开始，顺时针铺开
-        for ($i = 0; $i -lt $Values.Count; $i++) {
-            $v = [double]$Values[$i]
-            if ($v -le 0) { continue }
-            $sweep = 360.0 * $v / $total
-            if ($sweep -le 0) { continue }
-            $Graphics.FillPie((Get-MxBrush (Get-MxColor $Colors[$i])), $ox, $oy, $od, $od, $start, $sweep)
-            $start += $sweep
-        }
+        $Graphics.FillEllipse((Get-MxBrush (Get-MxColor $script:Mx.ChartUsed)), ($Cx - $OuterR), ($Cy - $OuterR), ($OuterR * 2), ($OuterR * 2))
+        $Graphics.FillEllipse((Get-MxBrush $BackColor), ($Cx - $InnerR), ($Cy - $InnerR), ($InnerR * 2), ($InnerR * 2))
+        return
     }
 
-    # 挖中心形成圆环
-    $Graphics.FillEllipse((Get-MxBrush $BackColor), ($Cx - $InnerR), ($Cy - $InnerR), ($InnerR * 2), ($InnerR * 2))
+    # 先把每段的起止角算好，绘制顺序与角度顺序解耦：
+    # 悬停段要最后画，否则它外移后露出的部分会被相邻段盖住。
+    $segs = New-Object System.Collections.ArrayList
+    $start = -90.0   # 从 12 点方向开始，顺时针铺开
+    for ($i = 0; $i -lt $Values.Count; $i++) {
+        $v = [double]$Values[$i]
+        $sweep = [double]0
+        if ($v -gt 0) { $sweep = 360.0 * $v / $total }
+        [void]$segs.Add(@{ I = $i; Start = $start; Sweep = $sweep })
+        $start += $sweep
+    }
+
+    $order = New-Object System.Collections.ArrayList
+    foreach ($s in $segs) { if ($s.Sweep -gt 0 -and $s.I -ne $Emphasize) { [void]$order.Add($s) } }
+    foreach ($s in $segs) { if ($s.Sweep -gt 0 -and $s.I -eq $Emphasize) { [void]$order.Add($s) } }
+
+    foreach ($s in $order) {
+        $grow = [double]0
+        if ($Grows -and $s.I -lt $Grows.Count) { $grow = [double]$Grows[$s.I] }
+
+        # 只把该段的外径撑大：圆心不动，圆环在该段范围内沿半径方向鼓出来。
+        # 不做整段位移，避免「抽出一块」的突兀感。
+        $rOutI = $OuterR + $grow
+        $ccx = $Cx
+        $ccy = $Cy
+
+        $ox = $ccx - $rOutI
+        $oy = $ccy - $rOutI
+        $od = $rOutI * 2
+        $ix = $ccx - $InnerR
+        $iy = $ccy - $InnerR
+        $id = $InnerR * 2
+
+        # 用「环形扇区路径：外弧正向 → 内弧反向 → 闭合」而不是「填充整块再挖孔」。
+        # 后者在单段外移时，挖孔圆会把这段的环形内缘切出一道缺口。
+        # AddArc 同样必须用数值重载，理由见下方 FillPie 的说明。
+        $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $p.AddArc($ox, $oy, $od, $od, $s.Start, $s.Sweep)
+        $p.AddArc($ix, $iy, $id, $id, ($s.Start + $s.Sweep), (-1 * $s.Sweep))
+        $p.CloseFigure()
+        $Graphics.FillPath((Get-MxBrush (Get-MxColor $Colors[$s.I])), $p)
+        $p.Dispose()
+    }
+}
+
+# 悬停探测：返回鼠标所在扇区的索引，以及 0..1 的「激活强度」。
+# 强度在半径与角度两个方向都做渐变：鼠标从环心、环外或相邻段慢慢移过来时，
+# 该段是逐渐伸出来的，而不是一越过边界就整块弹出。
+function Get-MxDonutProbe {
+    param(
+        [int]$X, [int]$Y,
+        [double]$Cx, [double]$Cy,
+        [double]$OuterR, [double]$InnerR,
+        [double[]]$Values,
+        [double]$Slack = 12,
+        [double]$AngMargin = 8
+    )
+
+    $none = @{ Index = -1; Strength = [double]0 }
+
+    $dx = [double]$X - $Cx
+    $dy = [double]$Y - $Cy
+    $r = [Math]::Sqrt($dx * $dx + $dy * $dy)
+    if ($r -lt ($InnerR - $Slack) -or $r -gt ($OuterR + $Slack)) { return $none }
+
+    # 半径方向渐变：落在环带内为 1，靠近环心或环外时线性衰减到 0
+    $sRad = [double]1
+    if ($r -lt $InnerR) {
+        $sRad = ($r - ($InnerR - $Slack)) / $Slack
+    } elseif ($r -gt $OuterR) {
+        $sRad = (($OuterR + $Slack) - $r) / $Slack
+    }
+    if ($sRad -lt 0) { $sRad = [double]0 }
+    if ($sRad -gt 1) { $sRad = [double]1 }
+
+    $total = [double]0
+    foreach ($v in $Values) { if ($v -gt 0) { $total += [double]$v } }
+    if ($total -le 0) { return $none }
+
+    $ang = [Math]::Atan2($dy, $dx) * 180.0 / [Math]::PI   # -180..180
+    $rel = $ang + 90.0                                    # 换算成以 12 点为起点、顺时针计的角度
+    while ($rel -lt 0) { $rel += 360.0 }
+    while ($rel -ge 360.0) { $rel -= 360.0 }
+
+    # 定位光标所在的那一段（四段正好铺满 360°，正常情况下必然命中一段）
+    $acc = [double]0
+    $bestIdx = -1
+    $segSweep = [double]0
+    $dNear = [double]0
+    for ($i = 0; $i -lt $Values.Count; $i++) {
+        $v = [double]$Values[$i]
+        if ($v -le 0) { continue }
+        $sweep = 360.0 * $v / $total
+        if ($rel -ge $acc -and $rel -lt ($acc + $sweep)) {
+            $bestIdx = $i
+            $segSweep = $sweep
+            $dNear = $rel - $acc
+            if ((($acc + $sweep) - $rel) -lt $dNear) { $dNear = ($acc + $sweep) - $rel }
+            break
+        }
+        $acc += $sweep
+    }
+    if ($bestIdx -lt 0) {
+        # 浮点误差让光标恰好落在最后一段末尾之外时，归入最后一个非空段
+        for ($i = $Values.Count - 1; $i -ge 0; $i--) {
+            if ([double]$Values[$i] -gt 0) { $bestIdx = $i; $segSweep = 360.0 * [double]$Values[$i] / $total; $dNear = [double]0; break }
+        }
+    }
+    if ($bestIdx -lt 0) { return $none }
+
+    # 角度方向渐变：越靠近该段边界越弱，光标从相邻段移过来时这一段是从边界一侧
+    # 逐渐伸展出来的。渐变宽度按该段自身宽度缩放，窄段才不会永远到不了满强度。
+    $m = [Math]::Min($AngMargin, $segSweep / 3.0)
+    if ($m -lt 0.5) { $m = 0.5 }
+    $sAng = [double]1
+    if ($dNear -lt $m) { $sAng = 0.4 + 0.6 * ($dNear / $m) }
+
+    return @{ Index = $bestIdx; Strength = ($sRad * $sAng) }
 }
 
 # ---------- 对话框 ----------
@@ -1319,10 +1424,27 @@ function Show-Gui {
         Unsel = [double]0; OtherUsed = [double]0
         Items = 0; SelCount = 0
         TotalText = '共 0 B'
-        Lg1 = '已勾选可释放   0 B'; Lg2 = '可清理未勾选   0 B'
-        Lg3 = '其他已用       0 B'; Lg4 = '可用空间       0 B'
-        P1 = '0.0%'; P2 = '0.0%'; P3 = '0.0%'; P4 = '0.0%'
         LowText = '低 0 项  0 B'; MidText = '中 0 项  0 B'; HighText = '高 0 项  0 B'
+        Values = @([double]0, [double]0, [double]0, [double]0)   # 四段数值，绘制与命中检测共用
+        Segs   = @()                                            # 四段的名称 / 数值文本 / 占比文本 / 颜色
+    }
+
+    # 悬停动画状态：Act 是缓动中的当前激活强度（0..1），Target 是探测出的目标强度。
+    # 状态存「强度」而不是「像素」，半径方向的渐近与外径扩张才能同步变化。
+    $script:MxChartHover  = -1
+    $script:MxChartAct    = @([double]0, [double]0, [double]0, [double]0)
+    $script:MxChartTarget = @([double]0, [double]0, [double]0, [double]0)
+    $script:MxChartGrow   = MxUF 18
+
+    # 图表几何只在这里算，绘制与命中检测都取它，避免两处圆心或半径不一致
+    function Get-MxChartGeometry {
+        param([int]$PanelW, [int]$PanelH)
+        [PSCustomObject]@{
+            Cx   = ($PanelW / 2.0)
+            Cy   = (MxUF 158)
+            ROut = (MxUF 88)
+            RIn  = (MxUF 60)
+        }
     }
 
     $chartPanel = New-Object System.Windows.Forms.Panel
@@ -1336,9 +1458,12 @@ function Show-Gui {
         $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
         $g.Clear($sender.BackColor)
 
-        $c  = $script:MxChart
-        $cw = $sender.Width
-        $px = MxU 24
+        $c   = $script:MxChart
+        $cw  = $sender.Width
+        $ch  = $sender.Height
+        $px  = MxU 24
+        $geo = Get-MxChartGeometry -PanelW $cw -PanelH $ch
+        $cx = $geo.Cx; $cy = $geo.Cy; $rOut = $geo.ROut; $rIn = $geo.RIn
 
         $brTitle = Get-MxBrush (Get-MxColor $script:Mx.OnBackground)
         $brMuted = Get-MxBrush (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
@@ -1349,15 +1474,15 @@ function Show-Gui {
         $g.DrawString($c.TotalText, $script:FFoot, $brMuted,
             (New-Object System.Drawing.RectangleF($px, (MxU 22), ($cw - $px * 2), (MxU 18))), $script:MxSfFar)
 
-        # 环形图
-        $cx   = $cw / 2.0
-        $cy   = MxUF 158
-        $rOut = MxUF 88
-        $rIn  = MxUF 60
+        # 环形图：悬停段按当前激活强度把外径撑大，且最后绘制
+        $cols  = @($script:Mx.ChartCleanSel, $script:Mx.ChartClean, $script:Mx.ChartUsed, $script:Mx.ChartFree)
+        $groPx = @([double]0, [double]0, [double]0, [double]0)
+        for ($i = 0; $i -lt 4; $i++) {
+            $groPx[$i] = [double]$script:MxChartAct[$i] * $script:MxChartGrow
+        }
         Draw-MxDonut -Graphics $g -Cx $cx -Cy $cy -OuterR $rOut -InnerR $rIn `
-                     -Values @($c.CleanSel, $c.Unsel, $c.OtherUsed, $c.Free) `
-                     -Colors @($script:Mx.ChartCleanSel, $script:Mx.ChartClean, $script:Mx.ChartUsed, $script:Mx.ChartFree) `
-                     -BackColor $sender.BackColor
+                     -Values $c.Values -Colors $cols -BackColor $sender.BackColor `
+                     -Grows $groPx -Emphasize $script:MxChartHover
 
         # 环心文字
         $holeW = $rIn * 2
@@ -1367,23 +1492,149 @@ function Show-Gui {
             (New-Object System.Drawing.RectangleF(($cx - $rIn), ($cy + (MxU 1)), $holeW, (MxU 24))), $script:MxSfCenter)
 
         # 图例
-        $legends = @(
-            @($script:Mx.ChartCleanSel, $c.Lg1, $c.P1),
-            @($script:Mx.ChartClean,    $c.Lg2, $c.P2),
-            @($script:Mx.ChartUsed,     $c.Lg3, $c.P3),
-            @($script:Mx.ChartFree,     $c.Lg4, $c.P4)
-        )
-        $ly = MxUF 264
-        foreach ($lg in $legends) {
-            $dr = New-Object System.Drawing.RectangleF($px, ($ly + (MxU 4)), (MxU 10), (MxU 10))
-            $dp = New-RoundedPath -Rect $dr -Radius (MxU 5)
-            $g.FillPath((Get-MxBrush (Get-MxColor $lg[0])), $dp)
-            $dp.Dispose()
-            $g.DrawString($lg[1], $script:FFoot, $brBody, ($px + (MxU 18)), $ly)
-            $g.DrawString($lg[2], $script:FFoot, $brMuted,
-                (New-Object System.Drawing.RectangleF($px, $ly, ($cw - $px * 2), (MxU 16))), $script:MxSfFar)
-            $ly += MxUF 29
+        $segs = $c.Segs
+        if ($segs.Count -ge 4) {
+            $ly = MxUF 274
+            for ($i = 0; $i -lt 4; $i++) {
+                $sg = $segs[$i]
+                $dr = New-Object System.Drawing.RectangleF($px, ($ly + (MxU 4)), (MxU 10), (MxU 10))
+                $dp = New-RoundedPath -Rect $dr -Radius (MxU 5)
+                $g.FillPath((Get-MxBrush (Get-MxColor $sg.Color)), $dp)
+                $dp.Dispose()
+                $g.DrawString($sg.Name, $script:FFoot, $brBody, ($px + (MxU 18)), $ly)
+                $g.DrawString($sg.Val, $script:FFoot, $brBody, ($px + (MxU 94)), $ly)
+                $g.DrawString($sg.Pct, $script:FFoot, $brMuted,
+                    (New-Object System.Drawing.RectangleF($px, $ly, ($cw - $px * 2), (MxU 16))), $script:MxSfFar)
+                $ly += MxUF 28
+            }
         }
+
+        # 悬停标注：从扇区外缘引出一条折线（先沿半径向外、再水平），末端给出这一段是什么。
+        # 引线长度与整体不透明度都随激活强度增长，所以是跟着光标慢慢伸出来，而不是突然出现。
+        $hi  = $script:MxChartHover
+        $act = [double]0
+        if ($hi -ge 0 -and $hi -lt 4) { $act = [double]$script:MxChartAct[$hi] }
+        if ($act -gt 0.02 -and $segs.Count -ge 4) {
+            $sg = $segs[$hi]
+            $alpha = [int][Math]::Round(255 * [Math]::Min(1.0, $act))
+
+            # 该段外缘中点：外径扩张量要算进去
+            $rEdge  = $rOut + $groPx[$hi]
+            $midRad = ($sg.Start + $sg.Sweep / 2.0) * [Math]::PI / 180.0
+            $ux = [Math]::Cos($midRad)
+            $uy = [Math]::Sin($midRad)
+            $dirX = [double]1
+            if ($ux -lt 0) { $dirX = [double]-1 }
+
+            $ext = (MxUF 3) + $act * (MxUF 15)
+            $p0x = $cx + $ux * $rEdge
+            $p0y = $cy + $uy * $rEdge
+            $p1x = $cx + $ux * ($rEdge + $ext)
+            $p1y = $cy + $uy * ($rEdge + $ext)
+            $p2x = $p1x + $dirX * (MxUF 18)
+            $p2y = $p1y
+
+            # 带透明度的画笔/画刷每帧新建、用完即弃：颜色缓存不支持逐帧变化的透明度，
+            # 而这些对象只在悬停期间存在，数量很小。
+            $cLead  = Get-MxColor $script:Mx.ChartLeader
+            $cTitle = Get-MxColor $script:Mx.OnBackground
+            $cMuted = Get-MxColor $script:Mx.OnSurfaceContainerVariant
+            $cBox   = Get-MxColor $script:Mx.Surface
+            $cSeg   = Get-MxColor $sg.Color
+            $penLead = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb($alpha, $cLead.R, $cLead.G, $cLead.B), [single](MxUF 2))
+            $brDot   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($alpha, $cSeg.R, $cSeg.G, $cSeg.B))
+            $brBox   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($alpha, $cBox.R, $cBox.G, $cBox.B))
+            $brName  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($alpha, $cTitle.R, $cTitle.G, $cTitle.B))
+            $brVal   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($alpha, $cMuted.R, $cMuted.G, $cMuted.B))
+
+            $g.DrawLine($penLead, [single]$p0x, [single]$p0y, [single]$p1x, [single]$p1y)
+            $g.DrawLine($penLead, [single]$p1x, [single]$p1y, [single]$p2x, [single]$p2y)
+
+            # 起点画一个小圆点，让引线明确落在扇区上
+            $dot = New-Object System.Drawing.RectangleF(($p0x - (MxU 3)), ($p0y - (MxU 3)), (MxU 6), (MxU 6))
+            $dp2 = New-RoundedPath -Rect $dot -Radius (MxU 3)
+            $g.FillPath($brDot, $dp2)
+            $g.DrawPath($penLead, $dp2)
+            $dp2.Dispose()
+
+            # 标注框（名称 / 数值与占比两行），越界时向内收，保证始终可见
+            $nameW  = $script:MxMeasure.MeasureString($sg.Name, $script:FBody).Width
+            $valStr = $sg.Val + '   ' + $sg.Pct
+            $valW   = $script:MxMeasure.MeasureString($valStr, $script:FCap).Width
+            $boxW = [Math]::Ceiling([Math]::Max($nameW, $valW)) + (MxU 20)
+            if ($boxW -gt ($cw - $px * 2)) { $boxW = $cw - $px * 2 }
+            $boxH = MxU 44
+
+            $bx = $p2x + $dirX * (MxU 6)
+            if ($dirX -lt 0) { $bx = $bx - $boxW }
+            if ($bx -lt $px) { $bx = $px }
+            if (($bx + $boxW) -gt ($cw - $px)) { $bx = $cw - $px - $boxW }
+            $by = $p2y - $boxH / 2
+            if ($by -lt (MxU 46)) { $by = MxU 46 }
+            if (($by + $boxH) -gt ($ch - (MxU 6))) { $by = $ch - (MxU 6) - $boxH }
+
+            $boxRect = New-Object System.Drawing.RectangleF($bx, $by, $boxW, $boxH)
+            $bp = New-RoundedPath -Rect $boxRect -Radius (MxU 10)
+            $g.FillPath($brBox, $bp)
+            $g.DrawPath($penLead, $bp)
+            $bp.Dispose()
+
+            $g.DrawString($sg.Name, $script:FBody, $brName, ($bx + (MxU 10)), ($by + (MxU 6)))
+            $g.DrawString($valStr, $script:FCap, $brVal, ($bx + (MxU 10)), ($by + (MxU 26)))
+
+            $penLead.Dispose(); $brDot.Dispose(); $brBox.Dispose(); $brName.Dispose(); $brVal.Dispose()
+        }
+    })
+
+    # 悬停判定：每次鼠标移动都重新探测强度，让该段跟着光标渐进伸缩
+    $chartPanel.add_MouseMove({
+        param($sender, $e)
+        $geo = Get-MxChartGeometry -PanelW $sender.Width -PanelH $sender.Height
+        $probe = Get-MxDonutProbe -X $e.X -Y $e.Y -Cx $geo.Cx -Cy $geo.Cy `
+                                  -OuterR $geo.ROut -InnerR $geo.RIn `
+                                  -Values $script:MxChart.Values -Slack (MxUF 14) -AngMargin 9
+        if ($probe.Index -ne $script:MxChartHover) {
+            $script:MxChartHover = $probe.Index
+            if ($probe.Index -ge 0) { $sender.Cursor = 'Hand' } else { $sender.Cursor = 'Default' }
+        }
+        for ($i = 0; $i -lt 4; $i++) {
+            $t = [double]0
+            if ($i -eq $probe.Index) { $t = $probe.Strength }
+            $script:MxChartTarget[$i] = $t
+        }
+        if ($null -ne $script:MxChartAnim -and -not $script:MxChartAnim.Enabled) {
+            $script:MxChartAnim.Start()
+        }
+    })
+    $chartPanel.add_MouseLeave({
+        param($sender, $e)
+        $script:MxChartHover = -1
+        $sender.Cursor = 'Default'
+        for ($i = 0; $i -lt 4; $i++) { $script:MxChartTarget[$i] = [double]0 }
+        if ($null -ne $script:MxChartAnim -and -not $script:MxChartAnim.Enabled) {
+            $script:MxChartAnim.Start()
+        }
+    })
+
+    # 16ms 定时器做缓动：逐帧把当前激活强度推向目标值，全部到位后自行停止。
+    # 系数取 0.13 是刻意的：鼠标快速划过时跟得上，同时伸展过程足够缓慢、不突兀。
+    $script:MxChartAnim = New-Object System.Windows.Forms.Timer
+    $script:MxChartAnim.Interval = 16
+    $script:MxChartAnim.add_Tick({
+        $moving = $false
+        for ($i = 0; $i -lt 4; $i++) {
+            $cur = [double]$script:MxChartAct[$i]
+            $tgt = [double]$script:MxChartTarget[$i]
+            $d = $tgt - $cur
+            if ([Math]::Abs($d) -lt 0.006) {
+                $script:MxChartAct[$i] = $tgt
+            } else {
+                $script:MxChartAct[$i] = $cur + $d * 0.13
+                $moving = $true
+            }
+        }
+        $chartPanel.Invalidate()
+        if (-not $moving) { $script:MxChartAnim.Stop() }
     })
 
     $cardDisk.Controls.Add($chartPanel)
@@ -1754,14 +2005,40 @@ function Show-Gui {
         $denom = [double]$c.CleanSel + $unsel + $otherUsed + [double]$c.Free
         if ($denom -le 0) { $denom = 1 }
         $c.TotalText = ('共 ' + (Format-Size $c.Total))
-        $c.Lg1 = '已勾选可释放   ' + (Format-Size $c.CleanSel)
-        $c.Lg2 = '可清理未勾选   ' + (Format-Size $unsel)
-        $c.Lg3 = '其他已用       ' + (Format-Size $otherUsed)
-        $c.Lg4 = '可用空间       ' + (Format-Size $c.Free)
-        $c.P1 = ('{0:N1}%' -f ([double]$c.CleanSel / $denom * 100))
-        $c.P2 = ('{0:N1}%' -f ($unsel / $denom * 100))
-        $c.P3 = ('{0:N1}%' -f ($otherUsed / $denom * 100))
-        $c.P4 = ('{0:N1}%' -f ([double]$c.Free / $denom * 100))
+
+        # 角度与图例共用同一份数据：绘制、命中检测、图例三者都从这里取，
+        # 起止角与 Draw-MxDonut 同规则（12 点起、顺时针、按正值归一）。
+        $vals  = @([double]$c.CleanSel, $unsel, $otherUsed, [double]$c.Free)
+        $names = @('已勾选可释放', '可清理未勾选', '其他已用', '可用空间')
+        $cols  = @($script:Mx.ChartCleanSel, $script:Mx.ChartClean, $script:Mx.ChartUsed, $script:Mx.ChartFree)
+        $pcts  = @(
+            ('{0:N1}%' -f ([double]$c.CleanSel / $denom * 100)),
+            ('{0:N1}%' -f ($unsel / $denom * 100)),
+            ('{0:N1}%' -f ($otherUsed / $denom * 100)),
+            ('{0:N1}%' -f ([double]$c.Free / $denom * 100))
+        )
+
+        $tot = [double]0
+        foreach ($v in $vals) { if ($v -gt 0) { $tot += $v } }
+
+        $segs = New-Object System.Collections.ArrayList
+        $start = -90.0
+        for ($i = 0; $i -lt 4; $i++) {
+            $sweep = [double]0
+            if ($vals[$i] -gt 0 -and $tot -gt 0) { $sweep = 360.0 * $vals[$i] / $tot }
+            [void]$segs.Add(@{
+                Color = $cols[$i]
+                Name  = $names[$i]
+                Val   = (Format-Size $vals[$i])
+                Pct   = $pcts[$i]
+                Start = $start
+                Sweep = $sweep
+            })
+            $start += $sweep
+        }
+
+        $c.Values = $vals
+        $c.Segs   = $segs
         $chartPanel.Invalidate()
     }
 
@@ -2013,6 +2290,7 @@ function Show-Gui {
     $form.add_FormClosing({
         param($sender, $e)
         try { $mxTimer.Stop() } catch { }
+        try { $script:MxChartAnim.Stop() } catch { }
         if (-not $script:RenderTo -and -not $script:BenchPaint -and -not $script:SnapTo) { Save-Config -Path $script:ConfigPath }
     })
 
@@ -2069,11 +2347,47 @@ function Show-Gui {
         Start-Sleep -Milliseconds 300
         [System.Windows.Forms.Application]::DoEvents()
 
+        # 截图期间真实鼠标可能恰好停在列表上，触发行悬停高亮，导致两次渲染对不上。
+        # 每次截图前统一清掉列表悬停状态，保证自检基线可复现。
+        $resetListHover = {
+            $script:MxHover = -1
+            $listView.Invalidate()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        & $resetListHover
         $bmpOut = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
         $form.DrawToBitmap($bmpOut, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
         $bmpOut.Save($script:RenderTo, [System.Drawing.Imaging.ImageFormat]::Png)
         $bmpOut.Dispose()
         Write-Host ('rendered -> ' + $script:RenderTo)
+
+        # 额外输出两张「模拟悬停」截图：一张伸展中途、一张完全展开，
+        # 用于核对「跟着光标渐进伸展」的中间形态是否符合预期。
+        # 取当前占比最大的一段，画面上更有代表性。
+        $pick = 0
+        for ($i = 1; $i -lt 4; $i++) {
+            if ([double]$script:MxChart.Values[$i] -gt [double]$script:MxChart.Values[$pick]) { $pick = $i }
+        }
+        $script:MxChartHover  = $pick
+        $script:MxChartTarget = @([double]0, [double]0, [double]0, [double]0)
+        foreach ($frame in @(@{ A = 0.45; S = '_hover_mid' }, @{ A = 1.00; S = '_hover' })) {
+            $script:MxChartAct = @([double]0, [double]0, [double]0, [double]0)
+            $script:MxChartAct[$pick] = [double]$frame.A
+            $chartPanel.Invalidate()
+            foreach ($k in 1..3) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 70
+            }
+            & $resetListHover
+            $bmpHover = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
+            $form.DrawToBitmap($bmpHover, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
+            $hoverOut = ($script:RenderTo -replace '\.png$', '') + $frame.S + '.png'
+            $bmpHover.Save($hoverOut, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpHover.Dispose()
+            Write-Host ('hover rendered -> ' + $hoverOut)
+        }
+        $script:MxChartHover = -1
+        $script:MxChartAct   = @([double]0, [double]0, [double]0, [double]0)
 
         $demoMsg = "即将永久删除以下 9 个项目的内容，不会进入回收站，删除后无法恢复。`r`n`r`n· 用户临时文件`r`n· 系统临时文件`r`n· 回收站`r`n· 缩略图 / 图标缓存`r`n· 崩溃转储文件`r`n· Windows 错误报告`r`n· 浏览器缓存`r`n· 开发工具缓存`r`n· 系统网络缓存"
         $null = Show-MxDialog -Title '确认清理' -Message $demoMsg -PrimaryText '开始清理' -SecondaryText '取消' -Width 520 -ScrollBody

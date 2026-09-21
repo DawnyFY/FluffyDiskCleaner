@@ -30,7 +30,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.3.2'
+$script:Version  = '1.3.3'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -1495,6 +1495,15 @@ function Show-Gui {
         $segs = $c.Segs
         if ($segs.Count -ge 4) {
             $ly = MxUF 274
+            # 名称列宽度按最长名称实测，数值列紧随其后。
+            # 原先数值列用固定偏移 MxU 94，但「已勾选可释放」这类六字名称实测已超出该列宽，
+            # 末字会被压进数值列，两段文字糊在一起，所以改为按实测宽度推算。
+            $nameW = [double]0
+            foreach ($s in $segs) {
+                $w = $script:MxMeasure.MeasureString($s.Name, $script:FFoot).Width
+                if ($w -gt $nameW) { $nameW = $w }
+            }
+            $valX = $px + (MxU 18) + $nameW + (MxU 16)
             for ($i = 0; $i -lt 4; $i++) {
                 $sg = $segs[$i]
                 $dr = New-Object System.Drawing.RectangleF($px, ($ly + (MxU 4)), (MxU 10), (MxU 10))
@@ -1502,7 +1511,7 @@ function Show-Gui {
                 $g.FillPath((Get-MxBrush (Get-MxColor $sg.Color)), $dp)
                 $dp.Dispose()
                 $g.DrawString($sg.Name, $script:FFoot, $brBody, ($px + (MxU 18)), $ly)
-                $g.DrawString($sg.Val, $script:FFoot, $brBody, ($px + (MxU 94)), $ly)
+                $g.DrawString($sg.Val, $script:FFoot, $brBody, $valX, $ly)
                 $g.DrawString($sg.Pct, $script:FFoot, $brMuted,
                     (New-Object System.Drawing.RectangleF($px, $ly, ($cw - $px * 2), (MxU 16))), $script:MxSfFar)
                 $ly += MxUF 28

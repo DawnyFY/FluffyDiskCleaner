@@ -30,7 +30,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.3.3'
+$script:Version  = '1.4.0'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -156,30 +156,240 @@ function Test-SafePath {
     return $true
 }
 
+# ======================= 多核并行目录遍历 =======================
+# 目录遍历是「系统调用密集型」，不是带宽密集型：实测 WinSxS（92223 个文件、10.97 GB）
+# 串行遍历 3.70 秒，CPU 时间与墙钟时间几乎相等（元数据都在缓存里，没在读盘）；
+# 换成同样的 C# 单线程仍要 3.14 秒，说明瓶颈也不在脚本解释开销，而在逐层枚举目录的系统调用。
+#
+# 但这类遍历可以按顶层分枝静态分片：WinSxS 有 21257 个顶层子目录，
+# 把分枝分给多个线程、各走各的、彼此不共享任何状态，就没有争用。
+# 实测（结果逐字节一致）：2 线程 2.29 秒、4 线程 1.76 秒、8 线程 1.39 秒。
+# 注意别用「多个线程抢同一个工作队列」的写法，那样反而比单线程更慢（实测 4.14 秒）。
+#
+# 顶层分枝不够铺满分片时会先向下细分几层（最多 8 层），细分时顺手把沿途文件算掉，
+# 保证每个文件只计一次。线程数按逻辑核数取 1/4，上限 8：既拿到大部分加速，
+# 又不至于把机器占满（线程越多总 CPU 越高，8 线程比串行多约 2 秒 CPU）。
+$script:MxFastThreads = [Math]::Min(8, [Math]::Max(2, [int]([Environment]::ProcessorCount / 4)))
+$script:MxFastOk = $false
+$script:MxFastRun = $null
+$script:MxFastHandle = $null
+$script:MxFastSrc = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+
+public static class MxFastSize
+{
+    static bool Skip(DirectoryInfo d)
+    {
+        try { return (d.Attributes & FileAttributes.ReparsePoint) != 0; } catch { return true; }
+    }
+
+    static long WalkOne(string root)
+    {
+        long sum = 0;
+        var stack = new Stack<string>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            string cur = stack.Pop();
+            try
+            {
+                var di = new DirectoryInfo(cur);
+                foreach (var f in di.EnumerateFiles()) { try { sum += f.Length; } catch { } }
+                foreach (var sd in di.EnumerateDirectories())
+                {
+                    try { if (Skip(sd)) continue; stack.Push(sd.FullName); } catch { }
+                }
+            }
+            catch { }
+        }
+        return sum;
+    }
+
+    public static long Get(string path, int threads)
+    {
+        if (File.Exists(path)) { try { return new FileInfo(path).Length; } catch { return 0; } }
+        if (!Directory.Exists(path)) { return 0; }
+        if (threads < 1) { threads = 1; }
+
+        long direct = 0;
+        var work = new List<string>();
+        try
+        {
+            var di = new DirectoryInfo(path);
+            foreach (var f in di.EnumerateFiles()) { try { direct += f.Length; } catch { } }
+            foreach (var sd in di.EnumerateDirectories()) { if (!Skip(sd)) work.Add(sd.FullName); }
+        }
+        catch { }
+
+        int level = 0;
+        while (work.Count < threads && level < 8)
+        {
+            level++;
+            var next = new List<string>();
+            foreach (var w in work)
+            {
+                try
+                {
+                    var di = new DirectoryInfo(w);
+                    foreach (var f in di.EnumerateFiles()) { try { direct += f.Length; } catch { } }
+                    foreach (var sd in di.EnumerateDirectories()) { if (!Skip(sd)) next.Add(sd.FullName); }
+                }
+                catch { }
+            }
+            if (next.Count == 0) { work = next; break; }
+            work = next;
+        }
+
+        if (work.Count == 0) { return direct; }
+        int n = Math.Min(threads, work.Count);
+        if (n <= 1)
+        {
+            long s1 = direct;
+            for (int i = 0; i < work.Count; i++) { s1 += WalkOne(work[i]); }
+            return s1;
+        }
+
+        var totals = new long[n];
+        var tasks = new Task[n];
+        for (int i = 0; i < n; i++)
+        {
+            int idx = i;
+            tasks[i] = Task.Factory.StartNew(delegate
+            {
+                long local = 0;
+                for (int k = idx; k < work.Count; k += n) { local += WalkOne(work[k]); }
+                totals[idx] = local;
+            });
+        }
+        Task.WaitAll(tasks);
+        long sum = direct;
+        for (int i = 0; i < n; i++) { sum += totals[i]; }
+        return sum;
+    }
+}
+'@
+
+# 在后台 runspace 里编译这三十来行 C#：约 200 毫秒，正好与启动动画并行，不占用户可见的时间。
+# 编译出来的类型落在同一个 AppDomain，主线程可以直接调用（已实测）。
+function Start-MxFastCompile {
+    if ($null -ne $script:MxFastHandle -or $script:MxFastOk) { return }
+    try {
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $rs.ApartmentState = 'MTA'
+        $rs.ThreadOptions = 'ReuseThread'
+        $rs.Open()
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript('param($s) Add-Type -TypeDefinition $s -Language CSharp').AddArgument($script:MxFastSrc)
+        $script:MxFastRun = $ps
+        $script:MxFastHandle = $ps.BeginInvoke()
+    } catch {
+        $script:MxFastRun = $null
+        $script:MxFastHandle = $null
+    }
+}
+
+function Wait-MxFastCompile {
+    if ($null -eq $script:MxFastHandle) { return }
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $script:MxFastHandle.IsCompleted -and $sw.ElapsedMilliseconds -lt 5000) {
+            Start-Sleep -Milliseconds 20
+        }
+        $null = $script:MxFastRun.EndInvoke($script:MxFastHandle)
+        $script:MxFastOk = $true
+    } catch {
+        # 编译失败（例如策略禁止动态编译）就退回纯 PowerShell 的遍历，功能不受影响
+        $script:MxFastOk = $false
+    }
+    try { $script:MxFastRun.Runspace.Close() } catch { }
+    try { $script:MxFastRun.Dispose() } catch { }
+    $script:MxFastRun = $null
+    $script:MxFastHandle = $null
+}
+
 function Get-PathSize {
     param([string]$Path)
+
+    # 优先走多核版本；编译还没好或调用出错则退回下面的纯 PowerShell 遍历
+    if ($script:MxFastOk) {
+        try { return [double][MxFastSize]::Get($Path, $script:MxFastThreads) } catch { }
+    }
+
     if (-not (Test-Path -LiteralPath $Path)) { return [double]0 }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $item) { return [double]0 }
     if (-not $item.PSIsContainer) { return [double]$item.Length }
-    $s = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-          Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $s) { return [double]0 }
-    return [double]$s
+
+    # 逐层遍历，并每隔约 20 毫秒让出一次消息循环。
+    # 原先一口气 Get-ChildItem -Recurse 算完，遇到大目录树会长时间独占 UI 线程：
+    # 启动动画正好在这段时间播放，于是出现明显卡顿（实测最长一帧间隔 646 毫秒、另有 4 帧超过 100 毫秒）。
+    # 改成显式遍历后既要定期 DoEvents，又顺手跳过重解析点（符号链接 / 联结点），避免绕圈或重复计数。
+    $sum  = [double]0
+    $dirs = New-Object System.Collections.Stack
+    $dirs.Push($Path)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $tick = 0
+    while ($dirs.Count -gt 0) {
+        $cur = $dirs.Pop()
+        try {
+            $di = [System.IO.DirectoryInfo]::new($cur)
+            foreach ($f in $di.EnumerateFiles()) {
+                try { $sum += [double]$f.Length } catch { }
+                # 单个目录里也可能塞着几十万个文件，所以文件级也要让出，
+                # 不能只在「换目录」时让。
+                $tick++
+                if ($tick -ge 1024) {
+                    $tick = 0
+                    if ($sw.ElapsedMilliseconds -ge 20) {
+                        [System.Windows.Forms.Application]::DoEvents()
+                        $sw.Restart()
+                    }
+                }
+            }
+            foreach ($sd in $di.EnumerateDirectories()) {
+                try {
+                    if (($sd.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $dirs.Push($sd.FullName)
+                } catch { }
+            }
+        } catch { }
+        if ($sw.ElapsedMilliseconds -ge 20) {
+            [System.Windows.Forms.Application]::DoEvents()
+            $sw.Restart()
+        }
+    }
+    return $sum
 }
 
 function Expand-Targets {
     param($Targets)
     $out = New-Object System.Collections.ArrayList
     if ($null -eq $Targets) { return $out }
+    # 展开通配符要逐个目录去列（例如 UWP 缓存要扫上百个包目录），
+    # 这里也按时间让出消息循环，否则启动动画会在这里被按住一段时间。
+    $swE = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($t in $Targets) {
         if ([string]::IsNullOrWhiteSpace($t)) { continue }
         $expanded = [System.Environment]::ExpandEnvironmentVariables($t)
         if ($expanded -match '[\*\?]') {
             $hits = Get-ChildItem -Path $expanded -Force -ErrorAction SilentlyContinue
-            foreach ($h in $hits) { [void]$out.Add($h.FullName) }
+            foreach ($h in $hits) {
+                [void]$out.Add($h.FullName)
+                if ($swE.ElapsedMilliseconds -ge 20) {
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $swE.Restart()
+                }
+            }
         } else {
             if (Test-Path -LiteralPath $expanded) { [void]$out.Add($expanded) }
+        }
+        if ($swE.ElapsedMilliseconds -ge 20) {
+            [System.Windows.Forms.Application]::DoEvents()
+            $swE.Restart()
         }
     }
     return $out
@@ -260,11 +470,17 @@ function New-Entry {
         Id       = $Id
         Name     = $Name
         Desc     = $Desc
+        # 动态描述以它为底重新拼接（例如还原点会补上个数与日期），
+        # 避免在已有描述上反复追加导致越描越长。
+        DescBase = $Desc
         Kind     = $Kind
         Targets  = $Targets
         Risk     = $Risk
         NeedAdmin = $NeedAdmin
         Size     = [double]0
+        # 尺寸列的替代表述（如「需管理员」「计算中…」）。为空时显示实际大小；
+        # 用于那些「读不到」和「真的是 0」必须区分开的项目。
+        SizeText = ''
         Selected = $Default
     }
 }
@@ -371,6 +587,7 @@ function Get-Catalog {
     [void]$list.Add((New-Entry 'MemoryDump' '内存转储文件' 'C:\MEMORY.DMP 与 Minidump，排查蓝屏用' 'RemoveDir' @("$sd\MEMORY.DMP", "$win\Minidump") '高' $false $true))
     [void]$list.Add((New-Entry 'UpgradeLeftover' '系统升级残留目录' '$WINDOWS.~BT / $WINDOWS.~WS 升级临时目录，以及 $WinREAgent / $GetCurrent / Panther 安装残留' 'RemoveDir' @("$sd\`$WINDOWS.~BT", "$sd\`$WINDOWS.~WS", "$sd\`$WinREAgent", "$sd\`$GetCurrent", "$win\Panther") '高' $false $true))
     [void]$list.Add((New-Entry 'WindowsOld' 'Windows.old' '系统升级前的旧系统备份，删除后无法回退到旧版本' 'RemoveDir' @("$sd\Windows.old") '高' $false $true))
+    [void]$list.Add((New-Entry 'RestorePoint' '系统还原点 / 卷影副本' '系统还原点占用的空间，删除后无法回滚系统' 'RestorePoint' @() '高' $false $true))
     [void]$list.Add((New-Entry 'Hibernate' '休眠文件 (hiberfil.sys)' '关闭休眠并删除休眠文件，会同时关闭「快速启动」功能' 'Hibernate' @() '高' $false $true))
 
     return $list
@@ -389,6 +606,93 @@ function Initialize-Entries {
 
 # ======================= 扫描与清理核心 =======================
 
+# 把 \\?\Volume{guid}\ 这类卷标识归一成 Volume{GUID}，
+# 因为同一个卷在 Win32_Volume、Win32_ShadowStorage、Win32_ShadowCopy 里的写法
+# 会带不带 \\?\ 前缀、带不带结尾反斜杠、大小写也不一致，直接比字符串会对不上。
+function Get-MxVolKey {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $m = [regex]::Match($Text, 'Volume\{[^}]+\}')
+    if ($m.Success) { return $m.Value.ToUpperInvariant() }
+    return $Text.Trim().TrimEnd('\').ToUpperInvariant()
+}
+
+# 读取系统还原点（本质是系统卷上的卷影副本）的占用情况。
+#
+# 数据来源是 VSS 的 WMI 提供程序，**需要管理员权限**：普通权限下枚举实例会直接抛
+# 「拒绝访问」。所以这里把所有异常都吞掉，统一以 Ok=$false 返回，由调用方提示
+# 「需管理员」——绝不能因为读不到就让整个扫描中断。
+# 之所以不用 vssadmin，是因为它的输出是本地化文本，解析「已用卷影副本存储空间」这类
+# 中文标签在不同语言系统上会直接失效，而 WMI 返回的是结构化的字节数。
+function Get-MxRestoreInfo {
+    param()
+    $info = [PSCustomObject]@{
+        Size       = [double]0
+        MaxSpace   = [double]0
+        Capacity   = [double]0
+        CapPercent = 0
+        Count      = 0
+        Oldest     = $null
+        Newest     = $null
+        Ok         = $false
+        Msg        = ''
+    }
+
+    # 卷容量与「还原点上限占磁盘的百分比」都不需要管理员权限，先单独取下来。
+    # 这样即使后面读占用被拒，提示也能从干巴巴的「读不到」变成「读不到，但上限是多少」。
+    $vol = $null
+    try {
+        $vol = Get-CimInstance -ClassName Win32_Volume -Filter ("DriveLetter='" + $env:SystemDrive + "'") -ErrorAction Stop |
+               Select-Object -First 1
+        if ($vol) { $info.Capacity = [double]$vol.Capacity }
+    } catch { }
+    try {
+        $p = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore\Cfg' -ErrorAction Stop
+        if ($null -ne $p.DiskPercent) { $info.CapPercent = [int]$p.DiskPercent }
+    } catch { }
+
+    try {
+        if (-not $vol) { $info.Msg = '未找到系统卷'; return $info }
+        $want = Get-MxVolKey ([string]$vol.DeviceID)
+
+        # 存储用量：DiffVolume 指向实际存放差异数据的卷
+        $stores = @(Get-CimInstance -ClassName Win32_ShadowStorage -ErrorAction Stop)
+        $mine = @($stores | Where-Object {
+            (Get-MxVolKey ([string]$_.DiffVolume)) -eq $want -or (Get-MxVolKey ([string]$_.Volume)) -eq $want
+        })
+        # 兜底：万一引用属性没能解析成路径（不同版本可能返回对象而非字符串），
+        # 而整机只有一个存储条目时，直接采用它，避免把真实占用读成 0。
+        if ($mine.Count -eq 0 -and $stores.Count -eq 1) { $mine = $stores }
+        foreach ($s in $mine) {
+            $info.Size     += [double]$s.UsedSpace
+            $info.MaxSpace += [double]$s.MaxSpace
+        }
+
+        # 逐个还原点，顺便取时间范围
+        $shadows = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop |
+                     Where-Object { (Get-MxVolKey ([string]$_.VolumeName)) -eq $want })
+        $info.Count = $shadows.Count
+        $times = @($shadows | ForEach-Object { $_.InstallDate } | Where-Object { $_ } | Sort-Object)
+        if ($times.Count -gt 0) {
+            $info.Oldest = $times[0]
+            $info.Newest = $times[$times.Count - 1]
+        }
+        $info.Ok = $true
+    } catch {
+        # VSS 提供程序在权限不足时统一返回 E_FAIL，本地化之后是「初始化失败」，
+        # 单独抛给用户完全看不出所以然；实测同一权限下 vssadmin 会明说
+        # 「You don't have the correct permissions」，可见就是权限问题，这里换成可操作的说明。
+        $raw = [string]$_.Exception.Message
+        $raw = $raw.Trim()
+        if ($raw -match '初始化失败|Initialization failure|拒绝访问|Access is denied|access is denied|permissions') {
+            $info.Msg = '需要管理员权限（卷影副本提供程序返回：' + $raw + '）'
+        } else {
+            $info.Msg = $raw
+        }
+    }
+    return $info
+}
+
 function Measure-Entry {
     param($Entry)
     switch ($Entry.Kind) {
@@ -401,12 +705,68 @@ function Measure-Entry {
         'Dism' {
             $Entry.Size = Get-PathSize (Join-Path $env:SystemRoot 'WinSxS')
         }
+        'RestorePoint' {
+            # 行内描述必须短：这一列只有 639 像素（列表 920 减去左右留白、开关与尺寸列），
+            # 超出去就会压在右侧的尺寸文字上。所以行里只放个数与最新日期的简写，
+            # 完整读数、上限、时间范围、以及第三方备份的提示都写进日志。
+            $ri = Get-MxRestoreInfo
+            if ($ri.Ok) {
+                $Entry.Size = $ri.Size
+                $Entry.SizeText = ''
+                $d = $Entry.DescBase
+                if ($ri.Count -gt 0) {
+                    $d += ('  ·  ' + $ri.Count + ' 个')
+                    if ($ri.Newest) { $d += ('，最新 ' + $ri.Newest.ToString('MM-dd')) }
+                } else {
+                    $d += '  ·  当前没有还原点'
+                }
+                $Entry.Desc = $d
+                $when = ''
+                if ($ri.Oldest -and $ri.Newest) {
+                    $when = '，' + $ri.Oldest.ToString('yyyy-MM-dd') + ' 至 ' + $ri.Newest.ToString('yyyy-MM-dd')
+                }
+                $cap = ''
+                if ($ri.MaxSpace -gt 0) { $cap = '，上限 ' + (Format-Size $ri.MaxSpace) }
+                Write-Log ('    还原点：' + $ri.Count + ' 个，占用 ' + (Format-Size $ri.Size) + $when + $cap)
+                if ($ri.Count -gt 0) {
+                    Write-Log '    提示：删除卷影副本会让依赖它的第三方备份一并失效'
+                }
+            } else {
+                # 读不到就是权限不够（VSS 的提供程序要求管理员）。
+                # 这里不能显示 0 B——那会让人误以为「没有还原点」，而实际上可能占着十几 GB。
+                $Entry.Size = [double]0
+                $Entry.SizeText = '需管理员'
+                # 上限占比在注册表里是公开的，没有管理员也能读到，用它把提示补完整
+                $capTxt = ''
+                if ($ri.CapPercent -gt 0) {
+                    $Entry.Desc = $Entry.DescBase + '  ·  上限 ' + $ri.CapPercent + '%'
+                    $capTxt = '，上限 ' + $ri.CapPercent + '%'
+                    if ($ri.Capacity -gt 0) {
+                        $capTxt += '（约 ' + (Format-Size ($ri.Capacity * $ri.CapPercent / 100.0)) + '）'
+                    }
+                } else {
+                    $Entry.Desc = $Entry.DescBase
+                }
+                Write-Log ('    还原点：' + $ri.Msg + $capTxt)
+            }
+        }
         'EventLog' {
             $Entry.Size = [double]0
         }
         default {
             $sum = [double]0
-            foreach ($p in (Expand-Targets $Entry.Targets)) { $sum += Get-PathSize $p }
+            # 这个分支动辄要遍历几百个路径（例如 UWP 缓存是几百个包目录），
+            # 单次 Get-PathSize 都很快，但累加起来仍会长时间占住 UI 线程——
+            # 实测这一项曾独占 504 毫秒，启动动画正好卡在那一下。
+            # 所以路径之间也要按时间让出消息循环。
+            $swY = [System.Diagnostics.Stopwatch]::StartNew()
+            foreach ($p in (Expand-Targets $Entry.Targets)) {
+                $sum += Get-PathSize $p
+                if ($swY.ElapsedMilliseconds -ge 20) {
+                    [System.Windows.Forms.Application]::DoEvents()
+                    $swY.Restart()
+                }
+            }
             $Entry.Size = $sum
         }
     }
@@ -448,6 +808,25 @@ function Invoke-Entry {
                 Write-Log ('    DISM 退出码: ' + $p.ExitCode)
             } catch { Write-Log ('    DISM 执行失败: ' + $_.Exception.Message) }
             $freed = 0
+        }
+
+        'RestorePoint' {
+            # 删除卷影副本只能交给 vssadmin（WMI 的 Delete 方法同样要管理员，且逐条删更慢）。
+            # /for 指定系统卷、/all 删除该卷全部卷影副本、/quiet 跳过交互确认。
+            $before = (Get-MxRestoreInfo).Size
+            try {
+                $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\vssadmin.exe') `
+                                   -ArgumentList @('delete', 'shadows', ('/for=' + $env:SystemDrive), '/all', '/quiet') `
+                                   -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                Write-Log ('    vssadmin 退出码: ' + $p.ExitCode)
+                if ($p.ExitCode -ne 0) {
+                    Write-Log '    删除失败：通常是没有管理员权限，或组策略禁止了卷影副本操作'
+                }
+            } catch { Write-Log ('    删除还原点失败: ' + $_.Exception.Message) }
+            # 卷影副本的释放不是瞬间完成的，等一会儿再复测，否则算出来的释放量会偏小
+            Start-Sleep -Milliseconds 1500
+            $after = (Get-MxRestoreInfo).Size
+            $freed = [Math]::Max(0, $before - $after)
         }
 
         'EventLog' {
@@ -516,6 +895,23 @@ function Get-DiskInfo {
     }
 }
 
+# 行内副标题：条目描述 + （非管理员时的）权限提示。
+# 界面上测完尺寸后还要重算一次（还原点等条目会把自己的读数补进描述里），所以抽成函数；
+# 放在脚本作用域是因为控制台模式也要用同一套文案。
+function Get-MxRowDesc {
+    param($Entry)
+    $d = [string]$Entry.Desc
+    if ($Entry.NeedAdmin -and -not $script:IsAdmin) { $d = $d + '  ·  需管理员权限' }
+    return $d
+}
+
+# 尺寸列文案：「读不到」和「真的是 0」必须能区分，前者用 SizeText 顶替。
+function Get-MxSizeText {
+    param($Entry)
+    if ($Entry.SizeText) { return [string]$Entry.SizeText }
+    return (Format-Size $Entry.Size)
+}
+
 # ======================= 控制台模式 =======================
 
 function Invoke-ConsoleMode {
@@ -533,7 +929,7 @@ function Invoke-ConsoleMode {
         Measure-Entry -Entry $e
         $flag = '[ ]'
         if ($e.Selected) { $flag = '[x]' }
-        Write-Host ('  {0} {1,-28} {2,10}  {3}' -f $flag, $e.Name, (Format-Size $e.Size), $e.Risk)
+        Write-Host ('  {0} {1,-28} {2,10}  {3}' -f $flag, $e.Name, (Get-MxSizeText $e), $e.Risk)
     }
 
     $picked = @($script:Entries | Where-Object { $_.Selected })
@@ -1222,11 +1618,13 @@ $script:DisclaimerText = @'
 
 本工具为个人开发并免费公开的技术实践项目，不构成商业软件或专业服务，也非微软官方产品或经其认证的组件。本工具按「现状」（AS IS）提供，不附带任何明示或默示担保。
 
+本工具的开发与验证集中在 Windows 11 家庭版（中文，25H2）· PowerShell 5.1 · 125% 缩放的环境下；其他系统版本、系统语言与缩放比例未经完整验证。
+
 二、风险告知
 
 1. 本工具执行的是永久删除，被删除的文件无法通过常规手段恢复。
 
-2. 部分清理项具有不可逆的系统级影响：清空回收站会丢失其中待恢复的文件；删除 Windows.old 与系统升级残留后无法回退到升级前的系统版本；删除休眠文件会同时关闭「快速启动」；执行 Windows 组件清理 (DISM) 后无法回滚已安装的更新；清空系统事件日志后，原有记录无法再用于事后排查。
+2. 部分清理项具有不可逆的系统级影响：清空回收站会丢失其中待恢复的文件；删除 Windows.old 与系统升级残留后无法回退到升级前的系统版本；删除系统还原点 / 卷影副本后将无法回滚系统，依赖卷影副本的第三方备份也会一并失效；删除休眠文件会同时关闭「快速启动」；执行 Windows 组件清理 (DISM) 后无法回滚已安装的更新；清空系统事件日志后，原有记录无法再用于事后排查。
 
 3. 部分清理项会导致第三方软件需要重新下载依赖、重新构建或重新安装。
 
@@ -1357,9 +1755,11 @@ function Show-Gui {
     $form.Controls.Add($root)
 
     # ---- 标题栏 ----
+    # 高度 56 逻辑单位：这一栏要放下 15pt 的大标题与 8.5pt 的版本行，
+    # 原先 52 时两行只隔 4 像素，看起来像挤在一起（正文从 MxU 64 开始，加高 4 不冲突）。
     $titleBar = New-Object System.Windows.Forms.Panel
     $titleBar.Location = New-Object System.Drawing.Point(1, 1)
-    $titleBar.Size = New-Object System.Drawing.Size(($W - 2), (MxU 52))
+    $titleBar.Size = New-Object System.Drawing.Size(($W - 2), (MxU 56))
     $titleBar.BackColor = (Get-MxColor $script:Mx.Surface)
     $root.Controls.Add($titleBar)
 
@@ -1368,7 +1768,7 @@ function Show-Gui {
     $lblApp.Font = $script:FTitle
     $lblApp.ForeColor = (Get-MxColor $script:Mx.OnBackground)
     $lblApp.BackColor = [System.Drawing.Color]::Transparent
-    $lblApp.Location = New-Object System.Drawing.Point((MxU 24), (MxU 14))
+    $lblApp.Location = New-Object System.Drawing.Point((MxU 24), (MxU 10))
     $lblApp.Size = New-Object System.Drawing.Size((MxU 320), (MxU 26))
     $titleBar.Controls.Add($lblApp)
 
@@ -1377,7 +1777,7 @@ function Show-Gui {
     $lblVer.Font = $script:FCap
     $lblVer.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
     $lblVer.BackColor = [System.Drawing.Color]::Transparent
-    $lblVer.Location = New-Object System.Drawing.Point((MxU 24), (MxU 34))
+    $lblVer.Location = New-Object System.Drawing.Point((MxU 24), (MxU 36))
     $lblVer.Size = New-Object System.Drawing.Size((MxU 320), (MxU 16))
     $titleBar.Controls.Add($lblVer)
 
@@ -1724,16 +2124,16 @@ function Show-Gui {
         [void](Build-MxSwitchPaths -ViewWidth $ViewWidth)
     }
 
+    # 行内副标题与尺寸列文案由脚本作用域的 Get-MxRowDesc / Get-MxSizeText 提供，
+    # 控制台模式与图形界面共用同一套规则（见「控制台模式」一节之前）。
     function Update-MxRowCache {
         $rows = $script:MxRowCache
         for ($i = 0; $i -lt $script:Entries.Count; $i++) {
             $en = $script:Entries[$i]
             $c = $rows[$i]
             $c.NameW = $script:MxMeasure.MeasureString($en.Name, $script:FBody).Width
-            $d = $en.Desc
-            if ($en.NeedAdmin -and -not $script:IsAdmin) { $d = $d + '  ·  需管理员权限' }
-            $c.Desc = $d
-            $c.SizeText = Format-Size $en.Size
+            $c.Desc = Get-MxRowDesc $en
+            $c.SizeText = Get-MxSizeText $en
         }
     }
 
@@ -2109,23 +2509,41 @@ function Show-Gui {
             $ps = [System.Management.Automation.PowerShell]::Create()
             $ps.Runspace = $rs
             [void]$ps.AddScript({
-                param($p)
+                param($p, $th)
+                # 主线程会在启动动画期间把多核版本编译好（约 200 毫秒），这里先小等一会儿再开工，
+                # 这样这一项能在动画还没放完时就跑完，等于把它的开销整个藏进动画里。
+                $swWait = [System.Diagnostics.Stopwatch]::StartNew()
+                while (-not ('MxFastSize' -as [type]) -and $swWait.ElapsedMilliseconds -lt 4000) {
+                    Start-Sleep -Milliseconds 20
+                }
+                # 类型在同一 AppDomain，runspace 里也看得见；万一不可用就退回下面纯 PowerShell 的逐层遍历。
+                try {
+                    if ('MxFastSize' -as [type]) { return [double][MxFastSize]::Get($p, $th) }
+                } catch { }
+                # 注意：不要用 [System.IO.Directory]::EnumerateFiles 拿到路径再逐个转 FileInfo，
+                # 那样每个文件都会多一次 stat 系统调用；WinSxS 有九万多个文件，
+                # 实测这一项要多花一倍 CPU（7.1 秒 → 3.8 秒），而字节数完全一致。
+                # 用 DirectoryInfo.EnumerateFiles()，长度直接来自目录枚举本身返回的数据。
                 $sum = [double]0
                 $stack = New-Object System.Collections.Stack
                 $stack.Push($p)
                 while ($stack.Count -gt 0) {
                     $d = $stack.Pop()
                     try {
-                        foreach ($f in [System.IO.Directory]::EnumerateFiles($d)) {
-                            try { $sum += ([System.IO.FileInfo]$f).Length } catch { }
+                        $di = [System.IO.DirectoryInfo]::new($d)
+                        foreach ($f in $di.EnumerateFiles()) {
+                            try { $sum += [double]$f.Length } catch { }
                         }
-                    } catch { }
-                    try {
-                        foreach ($sd in [System.IO.Directory]::EnumerateDirectories($d)) { $stack.Push($sd) }
+                        foreach ($sd in $di.EnumerateDirectories()) {
+                            try {
+                                if (($sd.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                                $stack.Push($sd.FullName)
+                            } catch { }
+                        }
                     } catch { }
                 }
                 return $sum
-            }).AddArgument($Path)
+            }).AddArgument($Path).AddArgument($script:MxFastThreads)
             $script:MxAsyncPs = $ps
             $script:MxAsyncHandle = $ps.BeginInvoke()
             $script:MxAsyncIndex = $Index
@@ -2154,6 +2572,7 @@ function Show-Gui {
         $script:MxAsyncIndex = -1
         if ($idx -ge 0 -and $idx -lt $script:Entries.Count) {
             $script:Entries[$idx].Size = $val
+            $script:MxDismDone = $true
             $script:MxRowCache[$idx].SizeText = Format-Size $val
             Invalidate-MxRow $idx
             Update-MxSummary
@@ -2162,49 +2581,70 @@ function Show-Gui {
     })
     $mxTimer.Start()
 
+    # 扫描期间挂起重入。Get-PathSize 遍历大目录树时会让出消息循环，
+    # 若不设防，用户在扫描途中点「重新扫描」或「一键清理」会嵌进第二遍扫描。
+    $script:MxScanning = $false
+    # 系统组件库是否已有后台结果：用于避免扫描走到该项时重复启动一遍
+    $script:MxDismDone = $false
     function Invoke-MxScan {
-        $script:MxScrollY = 0
-        $script:MxHover = -1
-        foreach ($e in $script:Entries) { $e.Size = [double]0 }
-        Update-MxRowCache
-        $listView.Invalidate()
-        [System.Windows.Forms.Application]::DoEvents()
-
-        $swScan = [System.Diagnostics.Stopwatch]::StartNew()
-        $deferred = 0
-        for ($i = 0; $i -lt $script:Entries.Count; $i++) {
-            if ($script:Abort) { break }
-            $e = $script:Entries[$i]
-            $lblStatus.Text = ('正在扫描：' + $e.Name + ' ...')
-            [System.Windows.Forms.Application]::DoEvents()
-
-            if ($e.Kind -eq 'Dism') {
-                $script:MxRowCache[$i].SizeText = '计算中…'
-                Invalidate-MxRow $i
-                Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
-                $deferred++
-                continue
+        param([switch]$KeepSizes)
+        $script:MxScanning = $true
+        try {
+            $script:MxScrollY = 0
+            $script:MxHover = -1
+            # 开机首扫时尺寸本就是 0、行缓存也已在动画之前建好，这里就不必重来一遍：
+            # 重建 35 行缓存（含文字测量）要近两百毫秒，正好会压在启动动画的起手帧上。
+            if (-not $KeepSizes) {
+                foreach ($e in $script:Entries) { $e.Size = [double]0 }
+                $script:MxDismDone = $false
+                Update-MxRowCache
+                $listView.Invalidate()
+                [System.Windows.Forms.Application]::DoEvents()
             }
 
-            Measure-Entry -Entry $e
-            $script:MxRowCache[$i].SizeText = Format-Size $e.Size
-            Invalidate-MxRow $i
-            [System.Windows.Forms.Application]::DoEvents()
+            $swScan = [System.Diagnostics.Stopwatch]::StartNew()
+            $deferred = 0
+            for ($i = 0; $i -lt $script:Entries.Count; $i++) {
+                if ($script:Abort) { break }
+                $e = $script:Entries[$i]
+                $lblStatus.Text = ('正在扫描：' + $e.Name + ' ...')
+                [System.Windows.Forms.Application]::DoEvents()
+
+                if ($e.Kind -eq 'Dism') {
+                    # 开机首扫时这一项已经在动画期间跑完了，这里就不再重复启动；
+                    # 只有还没结果时（例如用户手动重新扫描）才显示「计算中…」并重新起一遍。
+                    if (-not $script:MxDismDone) {
+                        $script:MxRowCache[$i].SizeText = '计算中…'
+                        Invalidate-MxRow $i
+                        Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
+                        $deferred++
+                    }
+                    continue
+                }
+
+                Measure-Entry -Entry $e
+                $script:MxRowCache[$i].SizeText = Get-MxSizeText $e
+                $script:MxRowCache[$i].Desc = Get-MxRowDesc $e
+                Invalidate-MxRow $i
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            $swScan.Stop()
+            $script:MxLastScanMs = $swScan.Elapsed.TotalMilliseconds
+            Update-MxDisk
+            Update-MxSummary
+            $note = ''
+            if ($deferred -gt 0) { $note = '，另有 ' + $deferred + ' 项在后台计算' }
+            $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项  ·  扫描 ' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒')
+            Write-Log ('扫描完成：' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒' + $note)
+        } finally {
+            $script:MxScanning = $false
         }
-        $swScan.Stop()
-        $script:MxLastScanMs = $swScan.Elapsed.TotalMilliseconds
-        Update-MxDisk
-        Update-MxSummary
-        $note = ''
-        if ($deferred -gt 0) { $note = '，另有 ' + $deferred + ' 项在后台计算' }
-        $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项  ·  扫描 ' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒')
-        Write-Log ('扫描完成：' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒' + $note)
     }
 
     # ---- 按钮事件 ----
     $btnRescan.add_MouseUp({
         param($sender, $e)
-        if ($script:MxBusy) { return }
+        if ($script:MxBusy -or $script:MxScanning) { return }
         $script:MxBusy = $true
         Invoke-MxScan
         $script:MxBusy = $false
@@ -2238,7 +2678,7 @@ function Show-Gui {
 
     $btnClean.add_MouseUp({
         param($sender, $e)
-        if ($script:Cleaning) { return }
+        if ($script:Cleaning -or $script:MxScanning -or $script:MxBusy) { return }
         $targets = @($script:Entries | Where-Object { $_.Selected })
         if ($targets.Count -eq 0) {
             $null = Show-MxDialog -Title '未选择项目' -Message '请先开启至少一个清理项目。' -PrimaryText '知道了' -Width 400
@@ -2336,6 +2776,313 @@ function Show-Gui {
         return
     }
 
+    # ---- 启动动画：线条描绘的兽爪 ----
+    # 逐段「画」出一只兽爪：先掌垫，再四枚椭圆脚趾（内高外低、扇形外倾）。
+    # 每条路径预先算好累计长度，绘制时按总进度依次推进，所以是「画」出来而不是整体淡入。
+    # 画完稍作停留后向中心收拢消失，收场不会让界面突然跳出；动画期间点一下可立即跳过。
+    $script:MxClawPhase = 'idle'     # idle / draw / hold / fade
+    $script:MxClawDraw  = [double]0  # 描绘进度 0..1
+    $script:MxClawHold  = [double]0  # 停留计时（秒）
+    $script:MxClawFade  = [double]0  # 收拢进度 0..1
+    $script:MxClawSecDraw = 1.05
+    $script:MxClawSecHold = 0.30
+    $script:MxClawSecFade = 0.42
+    $script:MxClawCache = $null
+
+    # 椭圆展平为折线；$Rot 用于外侧脚趾的外倾
+    function New-MxEllipsePoints {
+        param([double]$Cx, [double]$Cy, [double]$Rx, [double]$Ry, [double]$Rot = 0, [int]$Steps = 84)
+        $pts = New-Object System.Collections.ArrayList
+        for ($i = 0; $i -le $Steps; $i++) {
+            $a  = 2.0 * [Math]::PI * $i / $Steps
+            $bx = $Rx * [Math]::Cos($a)
+            $by = $Ry * [Math]::Sin($a)
+            $x  = $Cx + ($bx * [Math]::Cos($Rot) - $by * [Math]::Sin($Rot))
+            $y  = $Cy + ($bx * [Math]::Sin($Rot) + $by * [Math]::Cos($Rot))
+            [void]$pts.Add((New-Object System.Drawing.PointF([single]$x, [single]$y)))
+        }
+        return $pts
+    }
+
+    # 圆上取点（角度制；屏幕坐标 y 向下，顺时针参数化）
+    function New-MxArcPt {
+        param([double]$Ox, [double]$Oy, [double]$Rad, [double]$Deg)
+        $a = $Deg * [Math]::PI / 180.0
+        return @([single]($Ox + $Rad * [Math]::Cos($a)), [single]($Oy + $Rad * [Math]::Sin($a)))
+    }
+
+    # 顺时针参数化下，该角度处的单位切向
+    function New-MxArcTan {
+        param([double]$Deg)
+        $a = $Deg * [Math]::PI / 180.0
+        return @([single](0.0 - [Math]::Sin($a)), [single]([Math]::Cos($a)))
+    }
+
+    # 掌垫轮廓：本质是「三个圆的并集」——上方一个圆，下方左右各一个等径圆。
+    # 并集的边界正好由三段圆弧拼成：上圆的顶弧、下右圆的右侧弧、下左圆的左侧弧。
+    # 三处接缝原是尖角（转角约 59 度与 75 度），现于接缝两侧各切掉一小段圆弧 $cut，
+    # 再用三次贝塞尔过渡，且过渡曲线两端切向与该处圆弧完全一致，所以接缝变成圆滑过渡而不见折角。
+    # 圆参数由参考图轮廓拟合得出（以掌垫半高为 1）：拟合均方误差 0.0008，
+    # 各高度上模型半宽与实测半宽之差不超过 0.03，底部缺口顶点 y=0.853 也与实测 0.86 吻合。
+    function New-MxPadPoints {
+        param([double]$Cx, [double]$Cy, [double]$R)
+        $ct = -0.2698; $rt = 0.7302       # 上圆：圆心 y、半径
+        $cb =  0.2901; $rb = 0.7099       # 下圆：圆心 y、半径（左右同径）
+        $dx =  0.4331                     # 下圆横向偏移
+        $aT0 = -173.13; $aT1 =   -6.87    # 上圆：左上接缝 → 右上接缝
+        $aR0 =  -65.72; $aR1 =  127.59    # 右圆：右上接缝 → 底部缺口
+        $aL0 =   52.41; $aL1 =  245.72    # 左圆：底部缺口 → 左上接缝
+        $cut = 0.25                       # 接缝两侧各切掉的弧长（以掌垫半高为 1）
+        $dT  = $cut / $rt * 180.0 / [Math]::PI
+        $dR  = $cut / $rb * 180.0 / [Math]::PI
+        $k   = $cut / 3.0
+        $arcs = @(
+            @{ Ox =  0.0;  Oy = $ct; Rad = $rt; A0 = $aT0; A1 = $aT1; D = $dT; N = 30 }
+            @{ Ox =  $dx;  Oy = $cb; Rad = $rb; A0 = $aR0; A1 = $aR1; D = $dR; N = 32 }
+            @{ Ox = -$dx;  Oy = $cb; Rad = $rb; A0 = $aL0; A1 = $aL1; D = $dR; N = 32 }
+        )
+        $norm = New-Object System.Collections.ArrayList
+        for ($s = 0; $s -lt 3; $s++) {
+            $seg = $arcs[$s]
+            $nxt = $arcs[($s + 1) % 3]
+            $aStart = $seg.A0 + $seg.D
+            $aEnd   = $seg.A1 - $seg.D
+            $from = 0
+            if ($s -gt 0) { $from = 1 }        # 起点已由上一段过渡曲线给出
+            for ($i = $from; $i -le $seg.N; $i++) {
+                $ang = $aStart + ($aEnd - $aStart) * $i / [double]$seg.N
+                [void]$norm.Add((New-MxArcPt $seg.Ox $seg.Oy $seg.Rad $ang))
+            }
+            # 接缝圆角：从本段弧末点平滑过渡到下一段弧起点，两端切向与圆弧一致
+            $pa = New-MxArcPt $seg.Ox $seg.Oy $seg.Rad $aEnd
+            $pb = New-MxArcPt $nxt.Ox $nxt.Oy $nxt.Rad ($nxt.A0 + $nxt.D)
+            $ta = New-MxArcTan $aEnd
+            $tb = New-MxArcTan ($nxt.A0 + $nxt.D)
+            $c1x = $pa[0] + $ta[0] * $k; $c1y = $pa[1] + $ta[1] * $k
+            $c2x = $pb[0] - $tb[0] * $k; $c2y = $pb[1] - $tb[1] * $k
+            for ($i = 1; $i -le 12; $i++) {
+                $t = $i / 12.0
+                $mt = 1.0 - $t
+                $qx = $mt * $mt * $mt * $pa[0] + 3.0 * $mt * $mt * $t * $c1x + 3.0 * $mt * $t * $t * $c2x + $t * $t * $t * $pb[0]
+                $qy = $mt * $mt * $mt * $pa[1] + 3.0 * $mt * $mt * $t * $c1y + 3.0 * $mt * $t * $t * $c2y + $t * $t * $t * $pb[1]
+                [void]$norm.Add(@([single]$qx, [single]$qy))
+            }
+        }
+        $pts = New-Object System.Collections.ArrayList
+        foreach ($p in $norm) {
+            [void]$pts.Add((New-Object System.Drawing.PointF([single]($Cx + $p[0] * $R), [single]($Cy + $p[1] * $R))))
+        }
+        return $pts
+    }
+
+    # 爪形：掌垫 + 四枚椭圆脚趾（内高外低、呈扇形）。坐标以 R（掌垫半高）为尺度。
+    # 位置与尺寸按参考图量测（趾心约 ±0.61 / ±1.50，趾半径比约 0.71），并把脚趾略收小、外移：
+    # 描边宽 3.5px 再加抗锯齿约 2px，中心线间距需超过 5.5px 才不会糊成一团，实测已留到约 9-10px。
+    function Get-MxClawPaths {
+        param([double]$Cx, [double]$Cy, [double]$S)
+        $paths = New-Object System.Collections.ArrayList
+        $R    = 0.3106 * $S
+        # 整只爪纵向居中：顶端在掌垫中心上方 1.600+0.620 R，底端在下方 1.000 R
+        $pady = $Cy + 0.610 * $R
+        # 先掌垫：视觉上先立住重心，再长出脚趾
+        [void]$paths.Add((New-MxPadPoints -Cx $Cx -Cy $pady -R $R))
+        $toes = @(
+            @{ X = -1.520; Y = -0.505; Rx = 0.440; Ry = 0.620; Rot = -0.115 }
+            @{ X = -0.611; Y = -1.600; Rx = 0.440; Ry = 0.620; Rot = -0.030 }
+            @{ X =  0.611; Y = -1.600; Rx = 0.440; Ry = 0.620; Rot =  0.030 }
+            @{ X =  1.520; Y = -0.505; Rx = 0.440; Ry = 0.620; Rot =  0.115 }
+        )
+        foreach ($t in $toes) {
+            [void]$paths.Add((New-MxEllipsePoints ($Cx + $t.X * $R) ($pady + $t.Y * $R) ($t.Rx * $R) ($t.Ry * $R) $t.Rot))
+        }
+        return $paths
+    }
+
+    # 路径缓存：尺寸不变则复用，避免每帧重算折线长度
+    function Get-MxClawCache {
+        param([int]$W, [int]$H)
+        if ($null -ne $script:MxClawCache -and $script:MxClawCache.W -eq $W -and $script:MxClawCache.H -eq $H) {
+            return $script:MxClawCache
+        }
+        $S  = [Math]::Min(([double]$H * 0.34), ([double]$W * 0.18))
+        $cx = $W / 2.0
+        $cy = ($H / 2.0) + $S * 0.06
+        $paths = Get-MxClawPaths -Cx $cx -Cy $cy -S $S
+        $cums  = New-Object System.Collections.ArrayList
+        $total = [double]0
+        foreach ($p in $paths) {
+            $cum = New-Object System.Collections.ArrayList
+            [void]$cum.Add([double]0)
+            $acc = [double]0
+            for ($i = 1; $i -lt $p.Count; $i++) {
+                $dx = [double]$p[$i].X - [double]$p[$i - 1].X
+                $dy = [double]$p[$i].Y - [double]$p[$i - 1].Y
+                $acc += [Math]::Sqrt($dx * $dx + $dy * $dy)
+                [void]$cum.Add($acc)
+            }
+            [void]$cums.Add($cum)
+            $total += $acc
+        }
+        $x0 = [double]::MaxValue; $y0 = [double]::MaxValue
+        $x1 = [double]::MinValue; $y1 = [double]::MinValue
+        foreach ($p in $paths) {
+            foreach ($q in $p) {
+                if ($q.X -lt $x0) { $x0 = [double]$q.X }
+                if ($q.Y -lt $y0) { $y0 = [double]$q.Y }
+                if ($q.X -gt $x1) { $x1 = [double]$q.X }
+                if ($q.Y -gt $y1) { $y1 = [double]$q.Y }
+            }
+        }
+        # 兽爪的外接矩形（留出描边与抗锯齿的余量）。
+        # 动画每帧只重画这一小块，而不是整块面板：面板有 1473×981 像素，
+        # 整块重画实测要 30-87 毫秒，正好把动画帧率压到二三十帧。
+        $mgn = [double](MxU 10)
+        $rect = New-Object System.Drawing.Rectangle(
+            [int][Math]::Floor($x0 - $mgn), [int][Math]::Floor($y0 - $mgn),
+            [int][Math]::Ceiling($x1 - $x0 + 2 * $mgn), [int][Math]::Ceiling($y1 - $y0 + 2 * $mgn))
+        $script:MxClawCache = [PSCustomObject]@{ W = $W; H = $H; Paths = $paths; Cums = $cums; Total = $total; S = $S; Rect = $rect }
+        return $script:MxClawCache
+    }
+
+    $splashPanel = New-Object System.Windows.Forms.Panel
+    $splashPanel.Location = New-Object System.Drawing.Point(1, (MxU 53))
+    $splashPanel.Size = New-Object System.Drawing.Size(($W - 2), ($PAGEH - (MxU 53) - 1))
+    $splashPanel.BackColor = (Get-MxColor $script:Mx.Surface)
+    $splashPanel.Visible = $false
+    $splashPanel.Cursor = 'Hand'
+    Enable-DoubleBuffer $splashPanel
+
+    $splashPanel.add_Paint({
+        param($sender, $e)
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear($sender.BackColor)
+
+        $cache = Get-MxClawCache -W $sender.Width -H $sender.Height
+        $c  = Get-MxColor $script:Mx.Primary
+        $al = [int][Math]::Round(255 * (1.0 - [double]$script:MxClawFade))
+        if ($al -lt 0) { $al = 0 }
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb($al, $c.R, $c.G, $c.B), [single](MxUF 2.8))
+        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+
+        $budget = $cache.Total * [double]$script:MxClawDraw
+        for ($pIdx = 0; $pIdx -lt $cache.Paths.Count; $pIdx++) {
+            if ($budget -le 0) { break }
+            $pts = $cache.Paths[$pIdx]
+            $cum = $cache.Cums[$pIdx]
+            $pathLen = $cum[$cum.Count - 1]
+            $need = $budget
+            if ($need -gt $pathLen) { $need = $pathLen }
+            # 找到已走完的最后一个采样点，再补出半段，线条末端才平滑
+            $last = 0
+            for ($i = 1; $i -lt $cum.Count; $i++) {
+                if ($cum[$i] -le $need) { $last = $i } else { break }
+            }
+            $seg = New-Object System.Collections.ArrayList
+            for ($i = 0; $i -le $last; $i++) { [void]$seg.Add($pts[$i]) }
+            if ($last -lt ($pts.Count - 1) -and $need -gt $cum[$last]) {
+                $segLen = $cum[$last + 1] - $cum[$last]
+                if ($segLen -gt 0.0001) {
+                    $f  = ($need - $cum[$last]) / $segLen
+                    $px = [double]$pts[$last].X + ([double]$pts[$last + 1].X - [double]$pts[$last].X) * $f
+                    $py = [double]$pts[$last].Y + ([double]$pts[$last + 1].Y - [double]$pts[$last].Y) * $f
+                    [void]$seg.Add((New-Object System.Drawing.PointF([single]$px, [single]$py)))
+                }
+            }
+            if ($seg.Count -ge 2) { $g.DrawLines($pen, [System.Drawing.PointF[]]$seg.ToArray()) }
+            $budget -= $pathLen
+        }
+        $pen.Dispose()
+
+        # 收场：整体向中心收拢后隐藏，界面不会突然跳出
+        $fd = [double]$script:MxClawFade
+        if ($fd -gt 0) {
+            $k = 1.0 - $fd
+            if ($k -lt 0.02) { $k = 0.02 }
+            $rw = [single]($sender.Width * $k)
+            $rh = [single]($sender.Height * $k)
+            $rad = [double](MxU 24)
+            $lim = ([Math]::Min($rw, $rh) / 2.0) - 1.0
+            if ($rad -gt $lim) { $rad = $lim }
+            if ($rad -lt 0) { $rad = 0 }
+            $rect = New-Object System.Drawing.RectangleF((($sender.Width - $rw) / 2.0), (($sender.Height - $rh) / 2.0), $rw, $rh)
+            $rp = New-RoundedPath -Rect $rect -Radius $rad
+            $sender.Region = New-Object System.Drawing.Region($rp)
+            $rp.Dispose()
+        }
+    })
+    $root.Controls.Add($splashPanel)
+
+    $script:MxSplashTimer = New-Object System.Windows.Forms.Timer
+    $script:MxSplashTimer.Interval = 16
+    # 进度按真实经过时间推进，而不是每帧固定加 16ms：
+    # 定时器在扫描期间会被拖慢，按帧累加会让动画整体变慢、与设定时长不符。
+    $script:MxClawWatch = New-Object System.Diagnostics.Stopwatch
+    $script:MxClawLast  = [double]0
+    $script:MxSplashTimer.add_Tick({
+        $now = $script:MxClawWatch.Elapsed.TotalSeconds
+        $dt  = $now - [double]$script:MxClawLast
+        $script:MxClawLast = $now
+        if ($dt -lt 0) { $dt = 0 }
+        if ($dt -gt 0.25) { $dt = 0.25 }
+        if ($script:MxClawPhase -eq 'draw') {
+            $script:MxClawDraw += $dt / $script:MxClawSecDraw
+            if ($script:MxClawDraw -ge 1.0) {
+                $script:MxClawDraw  = [double]1.0
+                $script:MxClawPhase = 'hold'
+                $script:MxClawHold  = [double]0.0
+            }
+        } elseif ($script:MxClawPhase -eq 'hold') {
+            $script:MxClawHold += $dt
+            if ($script:MxClawHold -ge $script:MxClawSecHold) { $script:MxClawPhase = 'fade' }
+        } elseif ($script:MxClawPhase -eq 'fade') {
+            $script:MxClawFade += $dt / $script:MxClawSecFade
+            if ($script:MxClawFade -ge 1.0) {
+                $script:MxClawFade  = [double]1.0
+                $script:MxClawPhase = 'idle'
+                $script:MxSplashTimer.Stop()
+                $splashPanel.Visible = $false
+                $splashPanel.Region = $null
+                return
+            }
+        } else {
+            $script:MxSplashTimer.Stop()
+            return
+        }
+        # 只重画兽爪所在的一小块；收场阶段面板的 Region 在收缩，需要整块重画
+        if ($script:MxClawPhase -ne 'fade' -and $null -ne $script:MxClawCache) {
+            $splashPanel.Invalidate($script:MxClawCache.Rect)
+        } else {
+            $splashPanel.Invalidate()
+        }
+    })
+
+    function Start-MxSplash {
+        $script:MxClawPhase  = 'draw'
+        $script:MxClawDraw   = [double]0
+        $script:MxClawHold   = [double]0
+        $script:MxClawFade   = [double]0
+        $splashPanel.Region  = $null
+        $splashPanel.Visible = $true
+        $splashPanel.BringToFront()
+        $splashPanel.Invalidate()
+        $script:MxClawWatch.Restart()
+        $script:MxClawLast = [double]0
+        $script:MxSplashTimer.Start()
+    }
+
+    # 点一下即可跳过：直接进入收场
+    $splashPanel.add_MouseUp({
+        param($sender, $e)
+        if ($script:MxClawPhase -eq 'draw' -or $script:MxClawPhase -eq 'hold') {
+            $script:MxClawDraw  = [double]1.0
+            $script:MxClawPhase = 'fade'
+            $script:MxClawFade  = [double]0.0
+        }
+    })
+
     # ---- 渲染自检 ----
     if ($script:RenderTo) {
         for ($i = 0; $i -lt $script:Entries.Count; $i++) {
@@ -2398,6 +3145,54 @@ function Show-Gui {
         $script:MxChartHover = -1
         $script:MxChartAct   = @([double]0, [double]0, [double]0, [double]0)
 
+        # 启动动画：输出兽爪描绘的三个阶段，用于核对线条形态与推进是否正常。
+        # 注意：DrawToBitmap 绘制重叠子控件的顺序与 z 序不一致（最顶层反而先画、被后画的盖住），
+        # 所以这里不直接截整窗，而是「先截主界面、再把面板单独绘制后叠上去」，结果与真实层叠一致。
+        $splashPanel.Visible = $true
+        $splashPanel.BringToFront()
+        foreach ($frame in @(@{ P = 0.22; S = '_splash_early' }, @{ P = 0.55; S = '_splash_mid' }, @{ P = 1.00; S = '_splash' })) {
+            $script:MxClawPhase  = 'idle'
+            $script:MxClawDraw   = [double]$frame.P
+            $script:MxClawHold   = [double]0
+            $script:MxClawFade   = [double]0
+            $splashPanel.Region  = $null
+            $splashPanel.Visible = $false
+            $splashPanel.Invalidate()
+            foreach ($k in 1..3) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 70
+            }
+            $bmpSplash = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
+            $form.DrawToBitmap($bmpSplash, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
+            # 单独绘制启动动画面板，再叠加到主界面上
+            $splashPanel.Visible = $true
+            $splashPanel.Invalidate()
+            foreach ($k in 1..3) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 70
+            }
+            $bmpPanel = New-Object System.Drawing.Bitmap($splashPanel.Width, $splashPanel.Height)
+            $splashPanel.DrawToBitmap($bmpPanel, (New-Object System.Drawing.Rectangle(0, 0, $splashPanel.Width, $splashPanel.Height)))
+            $gs = [System.Drawing.Graphics]::FromImage($bmpSplash)
+            $gs.DrawImageUnscaled($bmpPanel, $splashPanel.Left, $splashPanel.Top)
+            $gs.Dispose()
+            $bmpPanel.Dispose()
+            $splashOut = ($script:RenderTo -replace '\.png$', '') + $frame.S + '.png'
+            $bmpSplash.Save($splashOut, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpSplash.Dispose()
+            Write-Host ('splash rendered -> ' + $splashOut)
+        }
+        $splashPanel.Visible = $false
+
+        # 让动画完整跑一遍，确认缓动能自行推进到收场、并隐藏面板与清掉收拢用的 Region
+        Start-MxSplash
+        $swAnim = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($script:MxClawPhase -ne 'idle' -and $swAnim.ElapsedMilliseconds -lt 6000) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 16
+        }
+        Write-Host ('splash anim: phase=' + $script:MxClawPhase + '  耗时=' + $swAnim.ElapsedMilliseconds + 'ms  面板可见=' + $splashPanel.Visible + '  Region已清=' + ($null -eq $splashPanel.Region))
+
         $demoMsg = "即将永久删除以下 9 个项目的内容，不会进入回收站，删除后无法恢复。`r`n`r`n· 用户临时文件`r`n· 系统临时文件`r`n· 回收站`r`n· 缩略图 / 图标缓存`r`n· 崩溃转储文件`r`n· Windows 错误报告`r`n· 浏览器缓存`r`n· 开发工具缓存`r`n· 系统网络缓存"
         $null = Show-MxDialog -Title '确认清理' -Message $demoMsg -PrimaryText '开始清理' -SecondaryText '取消' -Width 520 -ScrollBody
 
@@ -2411,11 +3206,55 @@ function Show-Gui {
         Build-MxRowGeometry -ViewWidth $listView.Width
         Update-MxRowCache
         if ($script:RenderTo) { return }
+        # 多核遍历用的 C# 在这里开始编译：约 200 毫秒，正好与下面的启动动画并行跑完，
+        # 等到真正开始扫描时早就就绪了。
+        Start-MxFastCompile
+        # 把最重的系统组件库（WinSxS，九万多个文件、约 11 GB）单独交给后台线程，
+        # 与启动动画同时开跑：动画约 1.8 秒，够它用多核跑完，
+        # 于是这一项的开销整个藏在动画里，主线程全程只管把画面画顺。
+        # 后台线程会先等 C# 编译好再开工，所以这里不必等编译。
+        for ($i = 0; $i -lt $script:Entries.Count; $i++) {
+            if ($script:Entries[$i].Kind -eq 'Dism') {
+                $script:MxRowCache[$i].SizeText = '计算中…'
+                Invalidate-MxRow $i
+                Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
+                break
+            }
+        }
+        # 启动动画：先独占主线程把动画放完，再开始扫描。
+        # 早先是两者并行——扫描的 DoEvents 会让动画继续推进，总时长也对得上，
+        # 但实测会出现 100 毫秒以上的明显顿帧（最长 646 毫秒），观感很差。
+        # 串行之后动画稳定在十几毫秒一帧；扫描不再需要频繁让出消息循环，本身也更快，
+        # 整体启动时间只多出不到一秒。动画期间点一下仍可立即跳过。
+        if (-not $script:SnapTo -and -not $script:BenchPaint) {
+            Start-MxSplash
+            # 预热首帧：第一次绘制要构建路径缓存（约 90 毫秒），先把它单独画掉，
+            # 并把进度与计时一起归零，否则这一下会算在动画的第一帧上，
+            # 看起来就是「一上来先顿一下」。
+            $script:MxSplashTimer.Stop()
+            [System.Windows.Forms.Application]::DoEvents()
+            $script:MxClawDraw = [double]0
+            $script:MxClawHold = [double]0
+            $script:MxClawFade = [double]0
+            $script:MxClawWatch.Restart()
+            $script:MxClawLast = [double]0
+            $script:MxSplashTimer.Start()
+            $swIntro = [System.Diagnostics.Stopwatch]::StartNew()
+            # 这里不能用 Start-Sleep 控制节奏：Windows 的定时器粒度默认是 15.6 毫秒，
+            # 睡 4 毫秒实际会睡满一个粒度，再叠上每帧十几毫秒的绘制，
+            # 动画就被压到三十帧上下。DoEvents 空转时队列为空会立刻返回，
+            # 节奏完全交给 16 毫秒的动画定时器，正好是 60 帧；开销只有这一秒多的一个核。
+            while ($script:MxClawPhase -ne 'idle' -and $swIntro.ElapsedMilliseconds -lt 5000) {
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+        }
         Write-Log ('=== ' + $script:AppName + ' v' + $script:Version + '  ·  Miuix 界面 ===')
         Write-Log ('管理员权限: ' + $script:IsAdmin + '   缩放: ' + [math]::Round($script:MxScale * 100) + '%')
         if (-not $script:IsAdmin) { Write-Log '提示：未以管理员身份运行，标注「需管理员权限」的项目将无法清理。' }
         $listView.Focus()
-        Invoke-MxScan
+        # 动画已经放完，C# 也早就编译好了，这里基本不等待，只是取一下结果
+        Wait-MxFastCompile
+        Invoke-MxScan -KeepSizes
 
         if ($script:AutoClean -and $script:ConfigExisted) {
             for ($i = 5; $i -gt 0; $i--) {
@@ -2556,6 +3395,33 @@ function Invoke-SelfTest {
     Check ('清理项数量 = ' + $cat.Count) ($cat.Count -ge 20) '清理项过少'
     $ids = $cat | ForEach-Object { $_.Id }
     Check '清理项 ID 无重复' (($ids | Sort-Object -Unique).Count -eq $ids.Count) '存在重复 ID'
+    Check '包含系统还原点检测项' ($ids -contains 'RestorePoint') '未找到 RestorePoint 条目'
+
+    Write-Host ''
+    Write-Host '6) 系统还原点读取（有权限时应读到数据，无权限时应安全退化且不抛异常）'
+    try {
+        $ri = Get-MxRestoreInfo
+        Check '返回结构完整（Size / Count / Ok）' ($null -ne $ri -and $null -ne $ri.Size -and $null -ne $ri.Count -and $null -ne $ri.Ok) '返回结构不完整'
+        $rpEntry = $script:Entries | Where-Object { $_.Id -eq 'RestorePoint' } | Select-Object -First 1
+        if ($ri.Ok) {
+            Check ('读取成功：' + $ri.Count + ' 个还原点，占用 ' + (Format-Size $ri.Size)) ($ri.Size -ge 0) ('占用为负：' + $ri.Size)
+        } else {
+            Check ('无管理员权限时安全退化：' + $ri.Msg) ($ri.Size -eq 0) '退化时占用应为 0'
+        }
+        if ($rpEntry) {
+            $null = Measure-Entry -Entry $rpEntry
+            if ($ri.Ok) {
+                Check '测量后把读数并进描述' ($rpEntry.Desc.Length -gt $rpEntry.DescBase.Length) ('描述 = ' + $rpEntry.Desc)
+                Check '读得到时尺寸列不用替代文案' ([string]::IsNullOrEmpty($rpEntry.SizeText)) ('SizeText = ' + $rpEntry.SizeText)
+            } else {
+                Check '测量后尺寸列显示「需管理员」' ($rpEntry.SizeText -eq '需管理员') ('SizeText = ' + $rpEntry.SizeText)
+                # 权限提示是渲染行时追加的，不在条目自己的描述里，所以要测渲染用的那个函数
+                Check '行内描述会补上权限提示' ((Get-MxRowDesc $rpEntry) -match '需管理员权限') ('描述 = ' + (Get-MxRowDesc $rpEntry))
+            }
+        }
+    } catch {
+        Check '还原点读取不应抛异常' $false $_.Exception.Message
+    }
 
     Write-Host ''
     Write-Host ('=== 自检结束：通过 ' + $script:stPass + ' 项，失败 ' + $script:stFail + ' 项 ===')

@@ -1,0 +1,117 @@
+name: 问题反馈 / Bug 报告
+description: 报告使用中遇到的异常、崩溃、界面错位或读数不符
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先确认三件事：
+
+        1. 已查阅 [常见问题（FAQ）](https://github.com/DawnyFY/FluffyDiskCleaner/blob/main/FAQ.md)——`0 B`、`需管理员`、清理后空间没变等常见现象在那里都有解释
+        2. 已阅读 [免责声明](https://github.com/DawnyFY/FluffyDiskCleaner/blob/main/DISCLAIMER.md)——并留意其中的「测试环境」一节
+        3. 使用的是**最新版本**（历史版本仅作留档，不在维护范围内）
+
+        另外，建议先跑一次自检。它只在临时目录内操作，不会碰任何真实数据：
+
+        ```powershell
+        powershell -ExecutionPolicy Bypass -File .\DiskCleaner.ps1 -SelfTest
+        ```
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你期望的结果是什么？如果是读数不对，请附上你认为正确的数值。
+      placeholder: 例如：扫描完成后「系统还原点 / 卷影副本」显示 0 B，但用 vssadmin 查到实际占用约 12 GB。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 尽量写清操作顺序，便于定位。
+      placeholder: |
+        1. 双击 RunCleaner.bat
+        2. 等待扫描完成
+        3. 观察第 xx 行……
+    validations:
+      required: true
+
+  - type: input
+    id: item
+    attributes:
+      label: 涉及的清理项
+      description: 若与某个具体清理项有关，请填写界面上显示的名称。
+      placeholder: 例如：系统还原点 / 卷影副本
+
+  - type: dropdown
+    id: run-mode
+    attributes:
+      label: 运行方式
+      options:
+        - RunCleaner.bat（管理员权限）
+        - 直接运行 DiskCleaner.ps1（普通权限）
+        - 控制台模式（-Console）
+        - 其他方式
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 系统版本
+      description: 按 Win + R 输入 winver 可以查看。
+      placeholder: 例如：Windows 11 家庭版 25H2（内部版本 26200）
+    validations:
+      required: true
+
+  - type: input
+    id: powershell
+    attributes:
+      label: PowerShell 版本
+      description: 运行 `$PSVersionTable.PSVersion` 可以查看。
+      placeholder: 例如：5.1.26100.8655
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dpi
+    attributes:
+      label: 显示缩放
+      description: 设置 → 系统 → 显示 → 缩放。界面错位一类问题与它关系很大。
+      options:
+        - 100%
+        - 125%
+        - 150%
+        - 175%
+        - 200%
+        - 其他 / 不确定
+    validations:
+      required: true
+
+  - type: dropdown
+    id: selftest
+    attributes:
+      label: 自检结果
+      description: 运行 `-SelfTest` 后得到的结论。
+      options:
+        - 全部通过
+        - 存在失败项
+        - 未运行
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或报错信息
+      description: 界面底部日志区的相关内容，或控制台里打印的报错。没有可以留空。
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图
+      description: 可直接把图片拖拽到此处上传。没有可以留空。

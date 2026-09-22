@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 常见问题（FAQ）
+    url: https://github.com/DawnyFY/FluffyDiskCleaner/blob/main/FAQ.md
+    about: 先来这里排查：显示 0 B、显示「需管理员」、清理后空间没变、配置与卸载等
+  - name: 免责声明
+    url: https://github.com/DawnyFY/FluffyDiskCleaner/blob/main/DISCLAIMER.md
+    about: 删除行为的风险告知、测试环境范围与责任限制，使用前请阅读

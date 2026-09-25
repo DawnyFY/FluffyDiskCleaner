@@ -279,7 +279,7 @@ public static class MxFastSize
 }
 '@
 
-# 在后台 runspace 里编译这三十来行 C#：约 200 毫秒，正好与启动动画并行，不占用户可见的时间。
+# 在后台 runspace 里编译这三十来行 C#：约 200 毫秒，与首屏扫描并行，不占用户可见的时间。
 # 编译出来的类型落在同一个 AppDomain，主线程可以直接调用（已实测）。
 function Start-MxFastCompile {
     if ($null -ne $script:MxFastHandle -or $script:MxFastOk) { return }
@@ -318,7 +318,7 @@ function Wait-MxFastCompile {
     $script:MxFastHandle = $null
 }
 
-# 让出一次消息循环，好让启动动画之类的界面工作继续推进。
+# 让出一次消息循环，好让界面绘制这类工作继续推进。
 # 单独包一层而不是直接写 DoEvents：Get-PathSize / Expand-Targets / Measure-Entry
 # 这几个共享函数在「窗体还没建好」时也会被调用（启动时先判定哪些清理项适用、
 # 自检里也会调），那时 WinForms 还没加载，直接调 DoEvents 会抛 TypeNotFound。
@@ -350,7 +350,7 @@ function Get-PathSize {
 
     # 逐层遍历，并每隔约 20 毫秒让出一次消息循环。
     # 原先一口气 Get-ChildItem -Recurse 算完，遇到大目录树会长时间独占 UI 线程：
-    # 启动动画正好在这段时间播放，于是出现明显卡顿（实测最长一帧间隔 646 毫秒、另有 4 帧超过 100 毫秒）。
+    # 界面在这段时间会被按住，于是出现明显卡顿（实测最长一帧间隔 646 毫秒、另有 4 帧超过 100 毫秒）。
     # 改成显式遍历后既要定期 DoEvents，又顺手跳过重解析点（符号链接 / 联结点），避免绕圈或重复计数。
     $sum  = [double]0
     $dirs = New-Object System.Collections.Stack
@@ -394,7 +394,7 @@ function Expand-Targets {
     $out = New-Object System.Collections.ArrayList
     if ($null -eq $Targets) { return $out }
     # 展开通配符要逐个目录去列（例如 UWP 缓存要扫上百个包目录），
-    # 这里也按时间让出消息循环，否则启动动画会在这里被按住一段时间。
+    # 这里也按时间让出消息循环，否则界面会在这里被按住一段时间。
     $swE = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($t in $Targets) {
         if ([string]::IsNullOrWhiteSpace($t)) { continue }
@@ -950,7 +950,7 @@ function Measure-Entry {
             $sum = [double]0
             # 这个分支动辄要遍历几百个路径（例如 UWP 缓存是几百个包目录），
             # 单次 Get-PathSize 都很快，但累加起来仍会长时间占住 UI 线程——
-            # 实测这一项曾独占 504 毫秒，启动动画正好卡在那一下。
+            # 实测这一项曾独占 504 毫秒，界面会在这里停住一下。
             # 所以路径之间也要按时间让出消息循环。
             $swY = [System.Diagnostics.Stopwatch]::StartNew()
             foreach ($p in (Expand-Targets $Entry.Targets)) {
@@ -2705,8 +2705,8 @@ function Show-Gui {
             $ps.Runspace = $rs
             [void]$ps.AddScript({
                 param($p, $th)
-                # 主线程会在启动动画期间把多核版本编译好（约 200 毫秒），这里先小等一会儿再开工，
-                # 这样这一项能在动画还没放完时就跑完，等于把它的开销整个藏进动画里。
+                # 主线程会在首屏扫描期间把多核版本编译好（约 200 毫秒），这里先小等一会儿再开工，
+                # 这样这一项能在界面刚出来的那几秒里跑完，等于把它的开销藏进首屏扫描阶段。
                 $swWait = [System.Diagnostics.Stopwatch]::StartNew()
                 while (-not ('MxFastSize' -as [type]) -and $swWait.ElapsedMilliseconds -lt 4000) {
                     Start-Sleep -Milliseconds 20
@@ -2787,8 +2787,8 @@ function Show-Gui {
         try {
             $script:MxScrollY = 0
             $script:MxHover = -1
-            # 开机首扫时尺寸本就是 0、行缓存也已在动画之前建好，这里就不必重来一遍：
-            # 重建 35 行缓存（含文字测量）要近两百毫秒，正好会压在启动动画的起手帧上。
+            # 开机首扫时尺寸本就是 0、行缓存也已在扫描之前建好，这里就不必重来一遍：
+            # 重建 35 行缓存（含文字测量）要近两百毫秒，正好会压在首屏绘制上。
             if (-not $KeepSizes) {
                 foreach ($e in $script:Entries) { $e.Size = [double]0 }
                 $script:MxDismDone = $false
@@ -2806,7 +2806,7 @@ function Show-Gui {
                 [System.Windows.Forms.Application]::DoEvents()
 
                 if ($e.Kind -eq 'Dism') {
-                    # 开机首扫时这一项已经在动画期间跑完了，这里就不再重复启动；
+                    # 开机首扫时这一项已经在首屏阶段跑完了，这里就不再重复启动；
                     # 只有还没结果时（例如用户手动重新扫描）才显示「计算中…」并重新起一遍。
                     if (-not $script:MxDismDone) {
                         $script:MxRowCache[$i].SizeText = '计算中…'
@@ -2971,606 +2971,6 @@ function Show-Gui {
         return
     }
 
-    # ---- 启动动画的 C# 渲染器 ----
-    # 入场动画的绘制（相机角度、透视除法、18 层深度轮廓、按弧长描绘、玻璃面、扫光）都放在一个
-    # C# 类型里，比在 PowerShell 里逐点算快得多：150 帧实测整块面板重画中位 2.4 毫秒。
-    # 源码直接内嵌编译（Add-Type -TypeDefinition），主程序因此仍是单文件，不必把 .cs 一起分发；
-    # 独立源码见「启动动画-交接/SplashRenderer.cs」，两边改动要同步。
-    # 编译实测约 85 毫秒（只在类型尚未载入时编译一次）。万一编译失败，只是没有启动动画，程序照常可用。
-    $script:MxClawRendererCs = @'
-            using System;
-            using System.Collections.Generic;
-            using System.Drawing;
-            using System.Drawing.Drawing2D;
-
-            // The supplied paths remain in model space. Only the camera and reveal change.
-            public sealed class ClawFrame
-            {
-                public double Draw, Scale, Yaw, Pitch, Angle, Depth, Body, Shine, Text, Fade;
-            }
-
-            public static class ClawRenderer
-            {
-                public const double IgniteEnd = .3, BuildEnd = 1.4, RevealEnd = 2.9, SnapEnd = 3.4, End = 4.6, FadeDuration = .4;
-                static double Clamp(double x) { return Math.Max(0, Math.Min(1, x)); }
-                static double Smooth(double x) { x = Clamp(x); return x * x * (3 - 2 * x); }
-                static double Lerp(double a, double b, double t) { return a + (b - a) * t; }
-
-                public static ClawFrame State(double t, double fade)
-                {
-                    t = Math.Max(0, t);
-                    double turn = Smooth((t - 2.65) / .80);
-                    double settle = Smooth((t - SnapEnd) / (End - SnapEnd));
-                    double scale = t < .9 ? Lerp(1.35, 2.30, Smooth(t / .9)) : 2.30;
-                    if (t >= RevealEnd) scale = Lerp(2.30, 1.12, Smooth((t - RevealEnd) / (SnapEnd - RevealEnd)));
-                    if (t >= SnapEnd) scale = Lerp(1.12, 1, settle);
-                    return new ClawFrame {
-                        Draw = t < .3 ? .028 * Smooth(t / .3) : Lerp(.028, 1, Smooth((t - .3) / 2.5)),
-                        Scale = scale * (1 - .08 * Smooth(fade)),
-                        Yaw = Lerp(28, 0, turn), Pitch = Lerp(-8, 0, turn),
-                        Angle = Lerp(-10, 0, turn),
-                        Depth = .27 * Smooth(t / .9) * (1 - turn),
-                        Body = Smooth((t - 1.35) / 1.6),
-                        Shine = t < 1.4 ? -1 : (t < 2.6 ? (t - 1.4) / 1.2 :
-                            (t < 3.6 ? (t - 2.6) / 1.0 : (t - 3.6) / .65)),
-                        Text = Smooth((t - 3.35) / .40), Fade = 1 - Smooth(fade)
-                    };
-                }
-
-                static Color Ink(int alpha, int r, int g, int b, double fade)
-                { return Color.FromArgb((int)Math.Round(Math.Max(0, Math.Min(255, alpha * fade))), r, g, b); }
-
-                static PointF Project(PointF p, double z, ClawFrame f, double cx, double cy, double size)
-                {
-                    double x = (p.X - cx) / size, y = (p.Y - cy) / size;
-                    double yaw = f.Yaw * Math.PI / 180, pitch = f.Pitch * Math.PI / 180;
-                    double rx = x * Math.Cos(yaw) + z * Math.Sin(yaw);
-                    double rz = -x * Math.Sin(yaw) + z * Math.Cos(yaw);
-                    double ry = y * Math.Cos(pitch) - rz * Math.Sin(pitch);
-                    rz = y * Math.Sin(pitch) + rz * Math.Cos(pitch);
-                    double a = f.Angle * Math.PI / 180;
-                    double perspective = 3.8 / (3.8 + rz);
-                    double px = (rx * Math.Cos(a) - ry * Math.Sin(a)) * perspective;
-                    double py = (rx * Math.Sin(a) + ry * Math.Cos(a)) * perspective;
-                    return new PointF((float)(cx + px * size * f.Scale), (float)(cy + py * size * f.Scale));
-                }
-
-                // Arc length, rather than sample count, keeps the tracing speed uniform.
-                static PointF[] Trace(PointF[] source, double progress)
-                {
-                    if (progress <= 0) return new PointF[0];
-                    if (progress >= 1) return source;
-                    double total = 0;
-                    for (int i = 1; i < source.Length; i++) total += Distance(source[i - 1], source[i]);
-                    double remaining = total * progress;
-                    var points = new List<PointF>();
-                    points.Add(source[0]);
-                    for (int i = 1; i < source.Length; i++) {
-                        double length = Distance(source[i - 1], source[i]);
-                        if (remaining >= length) { points.Add(source[i]); remaining -= length; }
-                        else {
-                            double u = length > 0 ? remaining / length : 0;
-                            points.Add(new PointF((float)Lerp(source[i - 1].X, source[i].X, u),
-                                (float)Lerp(source[i - 1].Y, source[i].Y, u)));
-                            break;
-                        }
-                    }
-                    return points.ToArray();
-                }
-                static double Distance(PointF a, PointF b)
-                { double x = b.X - a.X, y = b.Y - a.Y; return Math.Sqrt(x * x + y * y); }
-
-                static GraphicsPath Path(PointF[] points, double z, ClawFrame frame, double cx, double cy, double size, bool closed)
-                {
-                    var path = new GraphicsPath();
-                    if (points.Length < 2) return path;
-                    var projected = new PointF[points.Length];
-                    for (int i = 0; i < points.Length; i++) projected[i] = Project(points[i], z, frame, cx, cy, size);
-                    path.AddLines(projected);
-                    if (closed) path.CloseFigure();
-                    return path;
-                }
-
-                static void Glow(Graphics g, PointF center, float radius, Color color)
-                {
-                    if (radius <= 0 || color.A == 0) return;
-                    using (var path = new GraphicsPath()) {
-                        path.AddEllipse(center.X - radius, center.Y - radius, radius * 2, radius * 2);
-                        using (var brush = new PathGradientBrush(path)) {
-                            brush.CenterColor = color;
-                            brush.SurroundColors = new [] { Color.FromArgb(0, color.R, color.G, color.B) };
-                            g.FillPath(brush, path);
-                        }
-                    }
-                }
-
-                public static void Draw(Graphics g, PointF[][] source, ClawFrame f, double cx, double cy, double size)
-                {
-                    if (f.Draw <= 0 || f.Fade <= 0) return;
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    double unit = size / 212.0;
-                    double[] starts = { .18, .14, 0, .22, .40 };
-                    double[] spans = { .79, .57, .62, .58, .60 };
-                    double topY = double.MaxValue, bottomY = double.MinValue;
-                    foreach (PointF[] contour in source) foreach (PointF point in contour) {
-                        PointF projected = Project(point, 0, f, cx, cy, size);
-                        topY = Math.Min(topY, projected.Y);
-                        bottomY = Math.Max(bottomY, projected.Y);
-                    }
-                    var glassBounds = new RectangleF((float)(cx - size * f.Scale), (float)(topY - 2),
-                        (float)(2 * size * f.Scale), (float)(bottomY - topY + 4));
-                    var progress = new double[source.Length];
-                    for (int i = 0; i < source.Length; i++) progress[i] = Clamp((f.Draw - starts[i]) / spans[i]);
-                    var center = new PointF((float)cx, (float)cy);
-                    Glow(g, center, (float)(size * f.Scale * .66), Ink((int)(18 * f.Body), 150, 192, 240, f.Fade));
-
-                    // Parallel contours are separate depth slices, not offset copies in screen space.
-                    for (int layer = 18; layer >= 1; layer--) {
-                        double depth = f.Depth * layer / 18.0;
-                        if (depth < .001) continue;
-                        using (var pen = new Pen(Ink((int)(36 * (1 - layer / 25.0)), 126, 169, 218, f.Fade), (float)(.85 * unit))) {
-                            pen.LineJoin = LineJoin.Round;
-                            for (int i = 0; i < source.Length; i++) {
-                                double q = Clamp(progress[i] - layer * .006 * (1 - f.Body));
-                                using (var path = Path(Trace(source[i], q), depth, f, cx, cy, size, q >= 1)) {
-                                    if (path.PointCount > 1) g.DrawPath(pen, path);
-                                }
-                            }
-                        }
-                    }
-
-                    using (var filled = new GraphicsPath(FillMode.Winding)) {
-                        for (int i = 0; i < source.Length; i++) {
-                            using (var silhouette = Path(Trace(source[i], progress[i]), 0, f, cx, cy, size, true)) {
-                                // The traced arc encloses a growing glass lens, without a horizontal wipe edge.
-                                if (silhouette.PointCount > 2) {
-                                    double opacity = Smooth(progress[i] / .7) * f.Fade;
-                                    using (var brush = new LinearGradientBrush(glassBounds,
-                                        Ink((int)Lerp(45, 229, f.Body), 216, 232, 250, opacity),
-                                        Ink((int)Lerp(65, 255, f.Body), 148, 178, 216, opacity), 90)) {
-                                        brush.WrapMode = WrapMode.TileFlipXY;
-                                        g.FillPath(brush, silhouette);
-                                    }
-                                    filled.AddPath(silhouette, false);
-                                }
-                            }
-                            PointF[] trace = Trace(source[i], progress[i]);
-                            using (var path = Path(trace, 0, f, cx, cy, size, progress[i] >= 1)) {
-                                if (path.PointCount < 2) continue;
-                                using (var edge = new Pen(Ink(78, 150, 178, 214, f.Fade), (float)(10 * unit))) {
-                                    edge.LineJoin = LineJoin.Round; edge.StartCap = edge.EndCap = LineCap.Round;
-                                    g.DrawPath(edge, path);
-                                }
-                                using (var edge = new Pen(Ink(228, 255, 255, 255, f.Fade), (float)(2.6 * unit))) {
-                                    edge.LineJoin = LineJoin.Round; edge.StartCap = edge.EndCap = LineCap.Round;
-                                    g.DrawPath(edge, path);
-                                }
-                                if (progress[i] > 0 && progress[i] < 1) {
-                                    PointF head = Project(trace[trace.Length - 1], 0, f, cx, cy, size);
-                                    Glow(g, head, (float)(20 * unit), Ink(160, 172, 208, 246, f.Fade));
-                                    Glow(g, head, (float)(9 * unit), Ink(240, 255, 255, 255, f.Fade));
-                                }
-                            }
-                        }
-                        // Broad travelling reflection: three passes follow the reference's material reveal.
-                        if (filled.PointCount > 0 && f.Shine >= 0 && f.Shine <= 1) {
-                            GraphicsState saved = g.Save();
-                            g.SetClip(filled, CombineMode.Intersect);
-                            float x = (float)(cx + (f.Shine * 2 - 1) * size * f.Scale * .95);
-                            float half = (float)(size * f.Scale * .17);
-                            float slope = (float)(size * f.Scale * .14);
-                            float top = (float)(cy - size * f.Scale), bottom = (float)(cy + size * f.Scale);
-                            PointF[] band = { new PointF(x-half+slope,top), new PointF(x+half+slope,top),
-                                new PointF(x+half-slope,bottom), new PointF(x-half-slope,bottom) };
-                            using (var brush = new LinearGradientBrush(new PointF(x-half, (float)cy), new PointF(x+half,(float)cy), Color.Transparent, Color.White)) {
-                                var blend = new ColorBlend(3);
-                                blend.Colors = new [] { Color.Transparent, Ink(180,255,255,255,f.Fade), Color.Transparent };
-                                blend.Positions = new float[] { 0, .5f, 1 };
-                                brush.InterpolationColors = blend;
-                                g.FillPolygon(brush, band);
-                            }
-                            g.Restore(saved);
-                        }
-                    }
-                }
-            }
-
-'@
-    try {
-        if (-not ('ClawRenderer' -as [type])) {
-            Add-Type -TypeDefinition $script:MxClawRendererCs -ReferencedAssemblies System.Drawing -ErrorAction Stop
-        }
-        $script:MxClawRendererReady = $true
-    } catch {
-        $script:MxClawRendererReady = $false
-    }
-    # ---- 启动动画：液态玻璃兽爪「点亮 — 近景生长 — 巨幅成形 — 骤收 — 落定」 ----
-    # 动作骨架取自用户提供的本地参考视频（3840x2160 / 30fps / 273 帧）。
-    # 原片不是「中心竖条横向展开」：它先点亮一小段弧线，轮廓一边描绘一边持续向镜头推进，
-    # 身后留下多层挤出的轮廓；主体在近景中完整成形后，于约 0.3 秒内迅速缩到最终尺寸，
-    # 随后亮面扫过并稳定。主要动作按参考片前 4.2 秒展开，4.6 秒开始收场。
-    # 原片是「深红渐变底 + 三层金（淡金/金/橙）+ 白热笔头」，本项目沿用白色主题，
-    # 因此只取动作骨架，把材质换成液态玻璃：背后柔光 + 投影 + 半透明玻璃体 +
-    # 冷色折射边 + 白色镜面高光边；近景描完后凝成整块玻璃，再有一道镜面扫过，
-    # 最后落下工作室名称。
-    # 兽爪几何（三段圆弧拼出的掌垫 + 四枚脚趾）完全沿用，未改任何控制点。
-    $script:MxStudio = '林中晨曦工作室'
-    $script:MxClawPhase = 'idle'     # idle / run / fade
-    $script:MxClawT     = [double]0  # run 阶段累计秒数
-    $script:MxClawFade  = [double]0  # 收场进度 0..1
-    # 时间轴来自渲染器的常量，合计 4.6 秒 + 0.4 秒收场。
-    if ($script:MxClawRendererReady) {
-        $script:MxClawTIgnite = [ClawRenderer]::IgniteEnd
-        $script:MxClawTBuild  = [ClawRenderer]::BuildEnd - [ClawRenderer]::IgniteEnd
-        $script:MxClawTReveal = [ClawRenderer]::RevealEnd - [ClawRenderer]::BuildEnd
-        $script:MxClawTSnap   = [ClawRenderer]::SnapEnd - [ClawRenderer]::RevealEnd
-        $script:MxClawTHold   = [ClawRenderer]::End - [ClawRenderer]::SnapEnd
-        $script:MxClawTFade   = [ClawRenderer]::FadeDuration
-    } else {
-        # 渲染器没编译起来：时长整体归零，动画会被跳过，程序照常可用
-        $script:MxClawTIgnite = [double]0; $script:MxClawTBuild = [double]0
-        $script:MxClawTReveal = [double]0; $script:MxClawTSnap  = [double]0
-        $script:MxClawTHold = [double]0; $script:MxClawTFade  = [double]0
-    }
-    # 长稳定结束的时刻：五项相加，写成表达式以免以后调时长时对不上
-    $script:MxClawTEnd = [double]($script:MxClawTIgnite + $script:MxClawTBuild + $script:MxClawTReveal + $script:MxClawTSnap + $script:MxClawTHold)
-    $script:MxClawCache = $null
-    $script:MxClawFont  = $null
-
-    # 椭圆展平为折线；$Rot 用于外侧脚趾的外倾
-    function New-MxEllipsePoints {
-        param([double]$Cx, [double]$Cy, [double]$Rx, [double]$Ry, [double]$Rot = 0, [int]$Steps = 84)
-        $pts = New-Object System.Collections.ArrayList
-        for ($i = 0; $i -le $Steps; $i++) {
-            $a  = 2.0 * [Math]::PI * $i / $Steps
-            $bx = $Rx * [Math]::Cos($a)
-            $by = $Ry * [Math]::Sin($a)
-            $x  = $Cx + ($bx * [Math]::Cos($Rot) - $by * [Math]::Sin($Rot))
-            $y  = $Cy + ($bx * [Math]::Sin($Rot) + $by * [Math]::Cos($Rot))
-            [void]$pts.Add((New-Object System.Drawing.PointF([single]$x, [single]$y)))
-        }
-        return $pts
-    }
-
-    # 圆上取点（角度制；屏幕坐标 y 向下，顺时针参数化）
-    function New-MxArcPt {
-        param([double]$Ox, [double]$Oy, [double]$Rad, [double]$Deg)
-        $a = $Deg * [Math]::PI / 180.0
-        return @([single]($Ox + $Rad * [Math]::Cos($a)), [single]($Oy + $Rad * [Math]::Sin($a)))
-    }
-
-    # 顺时针参数化下，该角度处的单位切向
-    function New-MxArcTan {
-        param([double]$Deg)
-        $a = $Deg * [Math]::PI / 180.0
-        return @([single](0.0 - [Math]::Sin($a)), [single]([Math]::Cos($a)))
-    }
-
-    # 掌垫轮廓：本质是「三个圆的并集」——上方一个圆，下方左右各一个等径圆。
-    # 并集的边界正好由三段圆弧拼成：上圆的顶弧、下右圆的右侧弧、下左圆的左侧弧。
-    # 三处接缝原是尖角（转角约 59 度与 75 度），现于接缝两侧各切掉一小段圆弧 $cut，
-    # 再用三次贝塞尔过渡，且过渡曲线两端切向与该处圆弧完全一致，所以接缝变成圆滑过渡而不见折角。
-    # 圆参数由参考图轮廓拟合得出（以掌垫半高为 1）：拟合均方误差 0.0008，
-    # 各高度上模型半宽与实测半宽之差不超过 0.03，底部缺口顶点 y=0.853 也与实测 0.86 吻合。
-    function New-MxPadPoints {
-        param([double]$Cx, [double]$Cy, [double]$R)
-        $ct = -0.2698; $rt = 0.7302       # 上圆：圆心 y、半径
-        $cb =  0.2901; $rb = 0.7099       # 下圆：圆心 y、半径（左右同径）
-        $dx =  0.4331                     # 下圆横向偏移
-        $aT0 = -173.13; $aT1 =   -6.87    # 上圆：左上接缝 → 右上接缝
-        $aR0 =  -65.72; $aR1 =  127.59    # 右圆：右上接缝 → 底部缺口
-        $aL0 =   52.41; $aL1 =  245.72    # 左圆：底部缺口 → 左上接缝
-        $cut = 0.25                       # 接缝两侧各切掉的弧长（以掌垫半高为 1）
-        $dT  = $cut / $rt * 180.0 / [Math]::PI
-        $dR  = $cut / $rb * 180.0 / [Math]::PI
-        $k   = $cut / 3.0
-        $arcs = @(
-            @{ Ox =  0.0;  Oy = $ct; Rad = $rt; A0 = $aT0; A1 = $aT1; D = $dT; N = 30 }
-            @{ Ox =  $dx;  Oy = $cb; Rad = $rb; A0 = $aR0; A1 = $aR1; D = $dR; N = 32 }
-            @{ Ox = -$dx;  Oy = $cb; Rad = $rb; A0 = $aL0; A1 = $aL1; D = $dR; N = 32 }
-        )
-        $norm = New-Object System.Collections.ArrayList
-        for ($s = 0; $s -lt 3; $s++) {
-            $seg = $arcs[$s]
-            $nxt = $arcs[($s + 1) % 3]
-            $aStart = $seg.A0 + $seg.D
-            $aEnd   = $seg.A1 - $seg.D
-            $from = 0
-            if ($s -gt 0) { $from = 1 }        # 起点已由上一段过渡曲线给出
-            for ($i = $from; $i -le $seg.N; $i++) {
-                $ang = $aStart + ($aEnd - $aStart) * $i / [double]$seg.N
-                [void]$norm.Add((New-MxArcPt $seg.Ox $seg.Oy $seg.Rad $ang))
-            }
-            # 接缝圆角：从本段弧末点平滑过渡到下一段弧起点，两端切向与圆弧一致
-            $pa = New-MxArcPt $seg.Ox $seg.Oy $seg.Rad $aEnd
-            $pb = New-MxArcPt $nxt.Ox $nxt.Oy $nxt.Rad ($nxt.A0 + $nxt.D)
-            $ta = New-MxArcTan $aEnd
-            $tb = New-MxArcTan ($nxt.A0 + $nxt.D)
-            $c1x = $pa[0] + $ta[0] * $k; $c1y = $pa[1] + $ta[1] * $k
-            $c2x = $pb[0] - $tb[0] * $k; $c2y = $pb[1] - $tb[1] * $k
-            for ($i = 1; $i -le 12; $i++) {
-                $t = $i / 12.0
-                $mt = 1.0 - $t
-                $qx = $mt * $mt * $mt * $pa[0] + 3.0 * $mt * $mt * $t * $c1x + 3.0 * $mt * $t * $t * $c2x + $t * $t * $t * $pb[0]
-                $qy = $mt * $mt * $mt * $pa[1] + 3.0 * $mt * $mt * $t * $c1y + 3.0 * $mt * $t * $t * $c2y + $t * $t * $t * $pb[1]
-                [void]$norm.Add(@([single]$qx, [single]$qy))
-            }
-        }
-        $pts = New-Object System.Collections.ArrayList
-        foreach ($p in $norm) {
-            [void]$pts.Add((New-Object System.Drawing.PointF([single]($Cx + $p[0] * $R), [single]($Cy + $p[1] * $R))))
-        }
-        return $pts
-    }
-
-    # 爪形：掌垫 + 四枚椭圆脚趾（内高外低、呈扇形）。坐标以 R（掌垫半高）为尺度。
-    # 位置与尺寸按参考图量测（趾心约 ±0.61 / ±1.50，趾半径比约 0.71），并把脚趾略收小、外移：
-    # 描边宽 3.5px 再加抗锯齿约 2px，中心线间距需超过 5.5px 才不会糊成一团，实测已留到约 9-10px。
-    function Get-MxClawPaths {
-        param([double]$Cx, [double]$Cy, [double]$S)
-        $paths = New-Object System.Collections.ArrayList
-        $R    = 0.3106 * $S
-        # 整只爪纵向居中：顶端在掌垫中心上方 1.600+0.620 R，底端在下方 1.000 R
-        $pady = $Cy + 0.610 * $R
-        # 先掌垫：视觉上先立住重心，再长出脚趾
-        [void]$paths.Add((New-MxPadPoints -Cx $Cx -Cy $pady -R $R))
-        $toes = @(
-            @{ X = -1.520; Y = -0.505; Rx = 0.440; Ry = 0.620; Rot = -0.115 }
-            @{ X = -0.611; Y = -1.600; Rx = 0.440; Ry = 0.620; Rot = -0.030 }
-            @{ X =  0.611; Y = -1.600; Rx = 0.440; Ry = 0.620; Rot =  0.030 }
-            @{ X =  1.520; Y = -0.505; Rx = 0.440; Ry = 0.620; Rot =  0.115 }
-        )
-        foreach ($t in $toes) {
-            [void]$paths.Add((New-MxEllipsePoints ($Cx + $t.X * $R) ($pady + $t.Y * $R) ($t.Rx * $R) ($t.Ry * $R) $t.Rot))
-        }
-        return $paths
-    }
-
-    # 缓动与夹取。整套动画的所有参数都从同一条时间轴推出来并集中在下面一个函数里，
-    # 自检才能按任意时间点定格渲染，不会出现「只有播放路径画得出来」的情况。
-    function MxRamp {
-        param([double]$x)
-        if ($x -lt 0.0) { return [double]0 }
-        if ($x -gt 1.0) { return [double]1 }
-        return $x
-    }
-    function MxEaseOut {
-        param([double]$x, [double]$p = 2.0)
-        return (1.0 - [Math]::Pow(1.0 - $x, $p))
-    }
-    function MxEaseIn {
-        param([double]$x, [double]$p = 2.0)
-        return [Math]::Pow($x, $p)
-    }
-    function MxEaseInOut {
-        param([double]$x)
-        return ($x * $x * (3.0 - 2.0 * $x))
-    }
-
-    # 由累计时间推出这一帧的全部参数 —— 都在 C# 渲染器里（ClawRenderer.State）。
-    # 状态只依赖累计秒数，因而实时播放、关键帧定格渲染与逐帧导出走同一条计算路径。
-    function Get-MxSplashState {
-        param([double]$T)
-        # 渲染器没编译起来时返回空对象：调用方取 .Draw 等属性得到 $null（转 [double] 即 0），
-        # 等于什么都不画，不会因此报错。注意 param 必须是函数体第一条语句，守护要写在它之后。
-        if (-not $script:MxClawRendererReady) { return (New-Object PSObject) }
-        return [ClawRenderer]::State($T, [double]$script:MxClawFade)
-    }
-
-    # 路径缓存：尺寸不变则复用，避免每帧重算折线长度
-    function Get-MxClawCache {
-        param([int]$W, [int]$H)
-        if ($null -ne $script:MxClawCache -and $script:MxClawCache.W -eq $W -and $script:MxClawCache.H -eq $H) {
-            return $script:MxClawCache
-        }
-        $S  = [Math]::Min(([double]$H * 0.34), ([double]$W * 0.18))
-        $cx = $W / 2.0
-        # 下方要留落款的位置，所以爪心比面板中心略高一点，整组内容才居中
-        $cy = ($H / 2.0) - $S * 0.06
-        $paths = Get-MxClawPaths -Cx $cx -Cy $cy -S $S
-        $cums  = New-Object System.Collections.ArrayList
-        $total = [double]0
-        foreach ($p in $paths) {
-            $cum = New-Object System.Collections.ArrayList
-            [void]$cum.Add([double]0)
-            $acc = [double]0
-            for ($i = 1; $i -lt $p.Count; $i++) {
-                $dx = [double]$p[$i].X - [double]$p[$i - 1].X
-                $dy = [double]$p[$i].Y - [double]$p[$i - 1].Y
-                $acc += [Math]::Sqrt($dx * $dx + $dy * $dy)
-                [void]$cum.Add($acc)
-            }
-            [void]$cums.Add($cum)
-            $total += $acc
-        }
-        $x0 = [double]::MaxValue; $y0 = [double]::MaxValue
-        $x1 = [double]::MinValue; $y1 = [double]::MinValue
-        foreach ($p in $paths) {
-            foreach ($q in $p) {
-                if ($q.X -lt $x0) { $x0 = [double]$q.X }
-                if ($q.Y -lt $y0) { $y0 = [double]$q.Y }
-                if ($q.X -gt $x1) { $x1 = [double]$q.X }
-                if ($q.Y -gt $y1) { $y1 = [double]$q.Y }
-            }
-        }
-        # 玻璃体路径：把五条闭合回路并成一个 GraphicsPath，填充与剪裁都用它。
-        # 必须用 Winding —— 脚趾根部与掌垫本来就有极小重叠（内趾底边比掌垫顶边低约 0.02R），
-        # 默认的 Alternate 会把重叠处挖成洞。
-        $body = New-Object System.Drawing.Drawing2D.GraphicsPath
-        $body.FillMode = [System.Drawing.Drawing2D.FillMode]::Winding
-        foreach ($p in $paths) {
-            # 注意用 @() 包一层：Get-MxClawPaths 返回时 PowerShell 会把里层集合摊平成
-            # PointF[] 数组（不是 ArrayList），数组没有 ToArray() 方法，直接调会抛异常。
-            $body.AddLines([System.Drawing.PointF[]]@($p))
-            $body.CloseFigure()
-        }
-
-        # 落款：字体与位置一次算好。爪的上下半高相同（都是 1.610R），
-        # 文字直接贴在几何外接框下方即可。
-        if ($null -ne $script:MxClawFont) { $script:MxClawFont.Dispose() }
-        $script:MxClawFont = New-MxFont -Size (MxUF 11.5)
-        $tmpBmp = New-Object System.Drawing.Bitmap(1, 1)
-        $tmpG = [System.Drawing.Graphics]::FromImage($tmpBmp)
-        $txtSz = $tmpG.MeasureString($script:MxStudio, $script:MxClawFont)
-        $tmpG.Dispose(); $tmpBmp.Dispose()
-        $txtW = [double]$txtSz.Width
-        $txtH = [double]$txtSz.Height
-        $txtY = [double]$y1 + [double](MxUF 26)
-        $txtX = [double]$cx - $txtW / 2.0
-        if ($txtX -lt (MxU 8)) { $txtX = [double](MxU 8) }
-        if (($txtX + $txtW) -gt ($W - (MxU 8))) { $txtX = [double]($W - (MxU 8)) - $txtW }
-
-        # 重画区：动画每帧只重画这一小块，而不是整块面板
-        # （面板 1473x981，整块重画实测要 30-87 毫秒，正好把帧率压到二三十帧）。
-        # 这里必须严格覆盖「所有会画出来的东西」，否则区域外的像素会停在
-        # 上一次整块重画时的状态，动画里就会出现一圈看得见的接缝：
-        #   爪几何（含过冲） / 背后柔光 / 投影 / 笔头光晕 / 落款文字
-        # 括号里的每个系数都与绘制代码一一对应，改动任何一处半径都要同步这里。
-        $ov    = 2.40
-        $rHalo = 0.78
-        $rShad = 0.60
-        $rHead = 0.19
-        $clawL = ($cx - $x0) / $S
-        $clawR = ($x1 - $cx) / $S
-        $clawT = ($cy - $y0) / $S
-        $clawB = ($y1 - $cy) / $S
-        # 笔头永远落在爪的轮廓上，所以它的光晕外伸 = 爪的外伸 + 光晕半径
-        $extL = [Math]::Max($clawL + $rHead, 0.05 + $rHalo)
-        $extR = [Math]::Max($clawR + $rHead + 0.10, 0.03 + $rShad)
-        $extT = [Math]::Max($clawT + $rHead, 0.07 + $rHalo)
-        $extB = [Math]::Max($clawB + $rHead + 0.24, 0.14 + $rShad)
-        $mgn  = [double](MxU 12)
-        $ix0 = $cx - $extL * $S * $ov - $mgn
-        $iy0 = $cy - $extT * $S * $ov - $mgn
-        $ix1 = $cx + $extR * $S * $ov + $mgn
-        $iy1 = $cy + $extB * $S * $ov + $mgn
-        $ix0 = [Math]::Min($ix0, $txtX - $mgn)
-        $ix1 = [Math]::Max($ix1, $txtX + $txtW + $mgn)
-        $iy1 = [Math]::Max($iy1, $txtY + $txtH + $mgn)
-        $rect = New-Object System.Drawing.Rectangle(
-            [int][Math]::Floor($ix0), [int][Math]::Floor($iy0),
-            [int][Math]::Ceiling($ix1 - $ix0), [int][Math]::Ceiling($iy1 - $iy0))
-        $modelPaths = New-Object 'System.Drawing.PointF[][]' $paths.Count
-        for ($i = 0; $i -lt $paths.Count; $i++) {
-            $modelPaths[$i] = [System.Drawing.PointF[]]@($paths[$i])
-        }
-        $script:MxClawCache = [PSCustomObject]@{
-            ModelPaths = $modelPaths
-            W = $W; H = $H; Paths = $paths; Cums = $cums; Total = $total
-            S = $S; Cx = $cx; Cy = $cy; Body = $body; Rect = $rect
-            TextX = $txtX; TextY = $txtY; TextW = $txtW; TextH = $txtH
-        }
-        return $script:MxClawCache
-    }
-
-    $splashPanel = New-Object System.Windows.Forms.Panel
-    $splashPanel.Location = New-Object System.Drawing.Point(1, (MxU 53))
-    $splashPanel.Size = New-Object System.Drawing.Size(($W - 2), ($PAGEH - (MxU 53) - 1))
-    $splashPanel.BackColor = (Get-MxColor $script:Mx.Surface)
-    $splashPanel.Visible = $false
-    $splashPanel.Cursor = 'Hand'
-    Enable-DoubleBuffer $splashPanel
-
-    $paintSplash = {
-        param($sender, $e)
-        $g = $e.Graphics
-        $g.Clear($sender.BackColor)
-        $cache = Get-MxClawCache -W $sender.Width -H $sender.Height
-        $st = Get-MxSplashState -T ([double]$script:MxClawT)
-        if ($script:MxClawRendererReady) { [ClawRenderer]::Draw($g, $cache.ModelPaths, $st, $cache.Cx, $cache.Cy, $cache.S) }
-        $tv = [double]$st.Text * [double]$st.Fade
-        if ($tv -gt 0.001) {
-            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb([int](168 * $tv), 124, 136, 154))
-            $g.DrawString($script:MxStudio, $script:MxClawFont, $brush, [single]$cache.TextX, [single]$cache.TextY)
-            $brush.Dispose()
-        }
-
-        # 收场：整体向中心收拢后隐藏，界面不会突然跳出
-        $fd = [double]$script:MxClawFade
-        if ($fd -gt 0 -and -not $RenderTo) {
-            $fk = 1.0 - $fd
-            if ($fk -lt 0.02) { $fk = 0.02 }
-            $rw = [single]($sender.Width * $fk)
-            $rh = [single]($sender.Height * $fk)
-            $rad = [double](MxU 24)
-            $lim = ([Math]::Min($rw, $rh) / 2.0) - 1.0
-            if ($rad -gt $lim) { $rad = $lim }
-            if ($rad -lt 0) { $rad = 0 }
-            $frect = New-Object System.Drawing.RectangleF((($sender.Width - $rw) / 2.0), (($sender.Height - $rh) / 2.0), $rw, $rh)
-            $rp = New-RoundedPath -Rect $frect -Radius $rad
-            $sender.Region = New-Object System.Drawing.Region($rp)
-            $rp.Dispose()
-        }
-    }
-    $splashPanel.add_Paint($paintSplash)
-    $root.Controls.Add($splashPanel)
-
-    $script:MxSplashTimer = New-Object System.Windows.Forms.Timer
-    $script:MxSplashTimer.Interval = 16
-    # 进度按真实经过时间推进，而不是每帧固定加 16ms：
-    # 定时器在扫描期间会被拖慢，按帧累加会让动画整体变慢、与设定时长不符。
-    # 现在整条时间线只由一个累计秒数 $script:MxClawT 驱动，画面参数全部从它推出来
-    # （见 Get-MxSplashState），所以「播放」和「自检定格渲染」走的是同一条计算路径。
-    $script:MxClawWatch = New-Object System.Diagnostics.Stopwatch
-    $script:MxClawLast  = [double]0
-    $script:MxSplashTimer.add_Tick({
-        $now = $script:MxClawWatch.Elapsed.TotalSeconds
-        $dt  = $now - [double]$script:MxClawLast
-        $script:MxClawLast = $now
-        if ($dt -lt 0) { $dt = 0 }
-        if ($dt -gt 0.25) { $dt = 0.25 }
-        if ($script:MxClawPhase -eq 'run') {
-            $script:MxClawT += $dt
-            if ($script:MxClawT -ge $script:MxClawTEnd) {
-                $script:MxClawT     = [double]$script:MxClawTEnd
-                $script:MxClawPhase = 'fade'
-                $script:MxClawFade  = [double]0.0
-            }
-        } elseif ($script:MxClawPhase -eq 'fade') {
-            $script:MxClawFade += $dt / $script:MxClawTFade
-            if ($script:MxClawFade -ge 1.0) {
-                $script:MxClawFade  = [double]1.0
-                $script:MxClawPhase = 'idle'
-                $script:MxSplashTimer.Stop()
-                $splashPanel.Visible = $false
-                $splashPanel.Region = $null
-                return
-            }
-        } else {
-            $script:MxSplashTimer.Stop()
-            return
-        }
-        # 只重画兽爪所在的一小块；收场阶段面板的 Region 在收缩，需要整块重画
-        if ($script:MxClawPhase -ne 'fade' -and $null -ne $script:MxClawCache) {
-            $splashPanel.Invalidate($script:MxClawCache.Rect)
-        } else {
-            $splashPanel.Invalidate()
-        }
-    })
-
-    function Start-MxSplash {
-        if (-not $script:MxClawRendererReady) { return }
-        $script:MxClawPhase  = 'run'
-        $script:MxClawT      = [double]0
-        $script:MxClawFade   = [double]0
-        $splashPanel.Region  = $null
-        $splashPanel.Visible = $true
-        $splashPanel.BringToFront()
-        $splashPanel.Invalidate()
-        $script:MxClawWatch.Restart()
-        $script:MxClawLast = [double]0
-        $script:MxSplashTimer.Start()
-    }
-
-    # 点一下即可跳过：直接跳到长稳定结束，进入收场
-    $splashPanel.add_MouseUp({
-        param($sender, $e)
-        if ($script:MxClawPhase -eq 'run') {
-            $script:MxClawT     = [double]$script:MxClawTEnd
-            $script:MxClawPhase = 'fade'
-            $script:MxClawFade  = [double]0.0
-        }
-    })
 
     # ---- 渲染自检 ----
     if ($script:RenderTo) {
@@ -3634,84 +3034,6 @@ function Show-Gui {
         $script:MxChartHover = -1
         $script:MxChartAct   = @([double]0, [double]0, [double]0, [double]0)
 
-        # 启动动画：按时间轴定格输出五帧，覆盖点亮 / 近景生长 / 巨幅成形 / 骤收 / 落定。
-        # 面板本身就是按 $script:MxClawT 推参数的，所以这里只要设好时间点就能重现任意一帧，
-        # 不必真的等待播放。
-        # 注意：DrawToBitmap 绘制重叠子控件的顺序与 z 序不一致（最顶层反而先画、被后画的盖住），
-        # 所以这里不直接截整窗，而是「先截主界面、再把面板单独绘制后叠上去」，结果与真实层叠一致。
-        Write-Host ('splash timeline: 点亮0-' + $script:MxClawTIgnite + 's  近景生长至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild) + 's  巨幅成形至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild + [double]$script:MxClawTReveal) + 's  骤收至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild + [double]$script:MxClawTReveal + [double]$script:MxClawTSnap) + 's  落定至' + $script:MxClawTEnd + 's  收场共' + ($script:MxClawTEnd + $script:MxClawTFade) + 's')
-        $splashPanel.Visible = $true
-        $splashPanel.BringToFront()
-        $splashFrames = @(
-            @{ T = 0.30; S = '_splash_ignite' },
-            @{ T = 1.50; S = '_splash_build' },
-            @{ T = 2.80; S = '_splash_reveal' },
-            @{ T = 3.30; S = '_splash_snap' },
-            @{ T = 4.60; S = '_splash' }
-        )
-        foreach ($frame in $splashFrames) {
-            $script:MxClawPhase  = 'idle'
-            $script:MxClawT      = [double]$frame.T
-            $script:MxClawFade   = [double]0
-            $sc = Get-MxSplashState -T ([double]$frame.T)
-            Write-Host ('  t=' + $frame.T + 's  推进=' + [Math]::Round([double]$sc.Draw, 3) + '  缩放=' + [Math]::Round([double]$sc.Scale, 3) + '  压扁=' + [Math]::Round([double]$sc.Squash, 3) + '  玻璃体=' + [Math]::Round([double]$sc.Body, 3) + '  笔头=' + [Math]::Round([double]$sc.Head, 3) + '  柔光=' + [Math]::Round([double]$sc.Halo, 3) + '  镜面=' + [Math]::Round([double]$sc.Shine, 3) + '  落款=' + [Math]::Round([double]$sc.Text, 3))
-            $splashPanel.Region  = $null
-            $splashPanel.Visible = $false
-            $splashPanel.Invalidate()
-            foreach ($k in 1..3) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 70
-            }
-            $bmpSplash = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
-            $form.DrawToBitmap($bmpSplash, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
-            # 单独绘制启动动画面板，再叠加到主界面上
-            $splashPanel.Visible = $true
-            $splashPanel.Invalidate()
-            foreach ($k in 1..3) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 70
-            }
-            $bmpPanel = New-Object System.Drawing.Bitmap($splashPanel.Width, $splashPanel.Height)
-            $splashPanel.DrawToBitmap($bmpPanel, (New-Object System.Drawing.Rectangle(0, 0, $splashPanel.Width, $splashPanel.Height)))
-            $gs = [System.Drawing.Graphics]::FromImage($bmpSplash)
-            $gs.DrawImageUnscaled($bmpPanel, $splashPanel.Left, $splashPanel.Top)
-            $gs.Dispose()
-            $bmpPanel.Dispose()
-            $splashOut = ($script:RenderTo -replace '\.png$', '') + $frame.S + '.png'
-            $bmpSplash.Save($splashOut, [System.Drawing.Imaging.ImageFormat]::Png)
-            $bmpSplash.Dispose()
-            Write-Host ('splash rendered -> ' + $splashOut)
-        }
-        $splashPanel.Visible = $false
-
-        # 单帧耗时：用 Invalidate(小区域) + Update() 强制同步重绘来量，
-        # 与动画每帧真实做的事完全一致（DrawToBitmap 还要额外整块位图拷贝，会虚高）。
-        $script:MxClawCache = $null
-        $refCache = Get-MxClawCache -W $splashPanel.Width -H $splashPanel.Height
-        $splashPanel.Visible = $true
-        foreach ($probe in @(@{ T = 0.30; S = '点亮' }, @{ T = 1.50; S = '近景生长' }, @{ T = 2.80; S = '巨幅成形' }, @{ T = 4.60; S = '落定' })) {
-            $script:MxClawT = [double]$probe.T
-            $splashPanel.Invalidate($refCache.Rect)
-            $splashPanel.Update()
-            $n = 20
-            $swPaint = [System.Diagnostics.Stopwatch]::StartNew()
-            for ($j = 0; $j -lt $n; $j++) {
-                $splashPanel.Invalidate($refCache.Rect)
-                $splashPanel.Update()
-            }
-            $swPaint.Stop()
-            Write-Host ('splash repaint ' + $probe.S + ': ' + [Math]::Round($swPaint.Elapsed.TotalMilliseconds / $n, 1) + 'ms/帧  (重画区 ' + $script:MxClawCache.Rect.Width + 'x' + $script:MxClawCache.Rect.Height + ')')
-        }
-        $splashPanel.Visible = $false
-
-        # 让动画完整跑一遍，确认缓动能自行推进到收场、并隐藏面板与清掉收拢用的 Region
-        Start-MxSplash
-        $swAnim = [System.Diagnostics.Stopwatch]::StartNew()
-        while ($script:MxClawPhase -ne 'idle' -and $swAnim.ElapsedMilliseconds -lt 6000) {
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 16
-        }
-        Write-Host ('splash anim: phase=' + $script:MxClawPhase + '  耗时=' + $swAnim.ElapsedMilliseconds + 'ms  面板可见=' + $splashPanel.Visible + '  Region已清=' + ($null -eq $splashPanel.Region))
 
         $demoMsg = "即将永久删除以下 9 个项目的内容，不会进入回收站，删除后无法恢复。`r`n`r`n· 用户临时文件`r`n· 系统临时文件`r`n· 回收站`r`n· 缩略图 / 图标缓存`r`n· 崩溃转储文件`r`n· Windows 错误报告`r`n· 浏览器缓存`r`n· 开发工具缓存`r`n· 系统网络缓存"
         $null = Show-MxDialog -Title '确认清理' -Message $demoMsg -PrimaryText '开始清理' -SecondaryText '取消' -Width 520 -ScrollBody
@@ -3726,12 +3048,12 @@ function Show-Gui {
         Build-MxRowGeometry -ViewWidth $listView.Width
         Update-MxRowCache
         if ($script:RenderTo) { return }
-        # 多核遍历用的 C# 在这里开始编译：约 200 毫秒，正好与下面的启动动画并行跑完，
+        # 多核遍历用的 C# 在这里开始编译：约 200 毫秒，正好与首屏这段时间并行跑完，
         # 等到真正开始扫描时早就就绪了。
         Start-MxFastCompile
         # 把最重的系统组件库（WinSxS，九万多个文件、约 11 GB）单独交给后台线程，
-        # 与启动动画同时开跑：动画约 1.8 秒，够它用多核跑完，
-        # 于是这一项的开销整个藏在动画里，主线程全程只管把画面画顺。
+        # 界面刚出来的这几秒里跟其它工作一起跑：够它用多核跑完，
+        # 于是这一项的开销整个藏进首屏阶段，主线程全程只管把画面画顺。
         # 后台线程会先等 C# 编译好再开工，所以这里不必等编译。
         for ($i = 0; $i -lt $script:Entries.Count; $i++) {
             if ($script:Entries[$i].Kind -eq 'Dism') {
@@ -3739,34 +3061,6 @@ function Show-Gui {
                 Invalidate-MxRow $i
                 Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
                 break
-            }
-        }
-        # 启动动画：先独占主线程把动画放完，再开始扫描。
-        # 早先是两者并行——扫描的 DoEvents 会让动画继续推进，总时长也对得上，
-        # 但实测会出现 100 毫秒以上的明显顿帧（最长 646 毫秒），观感很差。
-        # 串行之后动画稳定在十几毫秒一帧；扫描不再需要频繁让出消息循环，本身也更快，
-        # 整体启动时间只多出不到一秒。动画期间点一下仍可立即跳过。
-        if (-not $script:SnapTo -and -not $script:BenchPaint) {
-            Start-MxSplash
-            # 预热首帧：第一次绘制要构建路径缓存（约 90 毫秒），先把它单独画掉，
-            # 并把进度与计时一起归零，否则这一下会算在动画的第一帧上，
-            # 看起来就是「一上来先顿一下」。
-            $script:MxSplashTimer.Stop()
-            [System.Windows.Forms.Application]::DoEvents()
-            $script:MxClawT    = [double]0
-            $script:MxClawFade = [double]0
-            $script:MxClawWatch.Restart()
-            $script:MxClawLast = [double]0
-            $script:MxSplashTimer.Start()
-            $swIntro = [System.Diagnostics.Stopwatch]::StartNew()
-            # 这里不能用 Start-Sleep 控制节奏：Windows 的定时器粒度默认是 15.6 毫秒，
-            # 睡 4 毫秒实际会睡满一个粒度，再叠上每帧十几毫秒的绘制，
-            # 动画就被压到三十帧上下。DoEvents 空转时队列为空会立刻返回，
-            # 节奏完全交给 16 毫秒的动画定时器，正好是 60 帧；开销只有这一秒多的一个核。
-            # 上限取整条时间轴加一秒余量，正常情况由动画自己收场退出。
-            $introLimit = [int](([double]$script:MxClawTEnd + [double]$script:MxClawTFade + 1.0) * 1000)
-            while ($script:MxClawPhase -ne 'idle' -and $swIntro.ElapsedMilliseconds -lt $introLimit) {
-                [System.Windows.Forms.Application]::DoEvents()
             }
         }
         Write-Log ('=== ' + $script:AppName + ' v' + $script:Version + '  ·  Miuix 界面 ===')
@@ -3779,7 +3073,7 @@ function Show-Gui {
             Write-Log '    装了对应软件（或在标准位置产生数据）后重新打开程序，它们会自己回来。'
         }
         $listView.Focus()
-        # 动画已经放完，C# 也早就编译好了，这里基本不等待，只是取一下结果
+        # C# 早就编译好了，这里基本不等待，只是取一下结果
         Wait-MxFastCompile
         Invoke-MxScan -KeepSizes
 

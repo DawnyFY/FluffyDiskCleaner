@@ -30,11 +30,15 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.4.0'
+$script:Version  = '1.5.0'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
 $script:Entries  = New-Object System.Collections.ArrayList
+# 被自动判定为「本机不适用」而没进列表的清理项（只用于日志与配置回写，不参与扫描与清理）
+$script:MxHiddenEntries = New-Object System.Collections.ArrayList
+# 列表右上角「共 N 项」后面跟着的短提示，由 Initialize-Entries 填好
+$script:MxMetaHidden = ''
 $script:DisclaimerAccepted = $false   # 是否已同意免责声明，未同意前不进入主界面
 
 # ======================= 基础工具函数 =======================
@@ -95,7 +99,10 @@ function Save-Config {
     param([string]$Path)
     try {
         $map = @{}
+        # 被自动隐藏的项也要写回：否则「本机暂时不适用」会把用户之前对它的勾选状态丢掉，
+        # 等它重新适用时又回到默认值。
         foreach ($e in $script:Entries) { $map[$e.Id] = [bool]$e.Selected }
+        foreach ($e in $script:MxHiddenEntries) { $map[$e.Id] = [bool]$e.Selected }
         $obj = [PSCustomObject]@{
             AutoClean = [bool]$script:AutoClean
             DisclaimerAccepted = [bool]$script:DisclaimerAccepted
@@ -311,6 +318,18 @@ function Wait-MxFastCompile {
     $script:MxFastHandle = $null
 }
 
+# 让出一次消息循环，好让启动动画之类的界面工作继续推进。
+# 单独包一层而不是直接写 DoEvents：Get-PathSize / Expand-Targets / Measure-Entry
+# 这几个共享函数在「窗体还没建好」时也会被调用（启动时先判定哪些清理项适用、
+# 自检里也会调），那时 WinForms 还没加载，直接调 DoEvents 会抛 TypeNotFound。
+$script:MxPumpOk = $false
+function Invoke-MxPump {
+    if (-not $script:MxPumpOk) {
+        if ('System.Windows.Forms.Application' -as [type]) { $script:MxPumpOk = $true } else { return }
+    }
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
 function Get-PathSize {
     param([string]$Path)
 
@@ -319,10 +338,15 @@ function Get-PathSize {
         try { return [double][MxFastSize]::Get($Path, $script:MxFastThreads) } catch { }
     }
 
-    if (-not (Test-Path -LiteralPath $Path)) { return [double]0 }
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if (-not $item) { return [double]0 }
-    if (-not $item.PSIsContainer) { return [double]$item.Length }
+    # 这里不能用 Test-Path / Get-Item 判断存在与取长度：
+    #   · Test-Path 在权限不足时返回 $false；
+    #   · Get-Item 直接抛「Cannot find path ... because it does not exist」——
+    #     实测 C:\hiberfil.sys 两条都中，而它其实有 12.5 GB。
+    # FileInfo / DirectoryInfo 只读目录项里的元数据，不需要文件读权限，实测能拿到长度。
+    $fi = New-Object System.IO.FileInfo($Path)
+    if ($fi.Exists) { return [double]$fi.Length }
+    $di = New-Object System.IO.DirectoryInfo($Path)
+    if (-not $di.Exists) { return [double]0 }
 
     # 逐层遍历，并每隔约 20 毫秒让出一次消息循环。
     # 原先一口气 Get-ChildItem -Recurse 算完，遇到大目录树会长时间独占 UI 线程：
@@ -345,7 +369,7 @@ function Get-PathSize {
                 if ($tick -ge 1024) {
                     $tick = 0
                     if ($sw.ElapsedMilliseconds -ge 20) {
-                        [System.Windows.Forms.Application]::DoEvents()
+                        Invoke-MxPump
                         $sw.Restart()
                     }
                 }
@@ -358,7 +382,7 @@ function Get-PathSize {
             }
         } catch { }
         if ($sw.ElapsedMilliseconds -ge 20) {
-            [System.Windows.Forms.Application]::DoEvents()
+            Invoke-MxPump
             $sw.Restart()
         }
     }
@@ -380,15 +404,18 @@ function Expand-Targets {
             foreach ($h in $hits) {
                 [void]$out.Add($h.FullName)
                 if ($swE.ElapsedMilliseconds -ge 20) {
-                    [System.Windows.Forms.Application]::DoEvents()
+                    Invoke-MxPump
                     $swE.Restart()
                 }
             }
         } else {
-            if (Test-Path -LiteralPath $expanded) { [void]$out.Add($expanded) }
+            # 加 -ErrorAction：像 Defender 的 Scans\History 这类目录普通权限读不到，
+            # Test-Path 会抛 Access is denied；控制台/自检模式下 ErrorActionPreference 是
+            # Continue，会把这一串报错刷到界面上，而这里本来就只是「存在就收下」的判断。
+            if (Test-Path -LiteralPath $expanded -ErrorAction SilentlyContinue) { [void]$out.Add($expanded) }
         }
         if ($swE.ElapsedMilliseconds -ge 20) {
-            [System.Windows.Forms.Application]::DoEvents()
+            Invoke-MxPump
             $swE.Restart()
         }
     }
@@ -410,11 +437,12 @@ function Clear-ReadOnlyRecursive {
 function Remove-PathPermanent {
     param([string]$Path, [switch]$KeepRoot)
     if (-not (Test-SafePath $Path)) { return @{ Ok = $false; Msg = '安全校验未通过，已跳过' } }
-    if (-not (Test-Path -LiteralPath $Path)) { return @{ Ok = $true; Msg = '不存在' } }
+    # 不能用 Test-Path / Get-Item 判断「不存在」：对 ACL 受限的路径两者都会谎报，
+    # 结果是本该清的项目被静默跳过（详见 Test-MxPathAbsent 上的说明）。
+    # 这里改为「确定不存在才跳过」，判断不了就照常尝试删除，失败会明写在日志里。
+    if (Test-MxPathAbsent -Path $Path) { return @{ Ok = $true; Msg = '不存在' } }
 
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if (-not $item) { return @{ Ok = $true; Msg = '不存在' } }
-    $isDir = $item.PSIsContainer
+    $isDir = -not (New-Object System.IO.FileInfo($Path)).Exists
     $failed = New-Object System.Collections.ArrayList
 
     if ($isDir -and $KeepRoot) {
@@ -445,13 +473,19 @@ function Remove-PathPermanent {
         }
     }
 
-    # 复核结果
+    # 复核结果。这里同样不能用 Test-Path：ACL 受限的路径它会返回 false，
+    # 于是「没删掉」会被报成「已删除」，日志里就少了一条本该出现的跳过说明。
     $remain = 0
-    if (Test-Path -LiteralPath $Path) {
+    if (-not (Test-MxPathAbsent -Path $Path)) {
         if ($KeepRoot -and $isDir) {
             $remain = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count
         } else {
             $remain = 1
+        }
+    } elseif ($failed.Count -gt 0) {
+        # 路径本身已经不在，但过程中有子项报过错——逐个复核，还留着的才算没删掉
+        foreach ($f in $failed) {
+            if (-not (Test-MxPathAbsent -Path $f)) { $remain++ }
         }
     }
 
@@ -545,6 +579,36 @@ function Get-Catalog {
     ) '低' $true $false))
     [void]$list.Add((New-Entry 'RdpCache' '远程桌面缓存' '远程桌面连接的位图缓存，删除后首次连接略慢' 'DirContent' @("$la\Microsoft\Terminal Server Client\Cache") '低' $true $false))
 
+    # 第三方软件的临时数据与日志。只碰「临时 / 日志」目录——
+    # 聊天记录、接收的文件、下载目录一律不列进来。
+    # 注意：本机没有安装 QQ 与百度网盘，这两项的路径是按官方文档与常见安装位置列的，
+    # 未能实测（DISCLAIMER 的「未经完整验证的部分」已注明），匹配不到时读取为 0 B。
+    # 注意：Windows 文件名不区分大小写，所以 Temp / temp 只能列一个，
+    # 否则同一个目录会被两个通配符各匹配一次、体积重复计入。
+    # 同理，同一项内的各条通配符之间也必须互不重叠。
+    [void]$list.Add((New-Entry 'QQTemp' 'QQ 临时数据' 'QQ 运行时的临时文件与日志（聊天记录、接收的文件不在此列）' 'DirContent' @(
+        "$ad\Tencent\QQ\Temp", "$ad\Tencent\QQ\*\Temp", "$ad\Tencent\QQ\*\nt_temp",
+        "$la\Tencent\QQ\Temp", "$ad\Tencent\QQNT\Temp", "$ad\Tencent\QQTempSys"
+    ) '低' $true $false))
+    [void]$list.Add((New-Entry 'BaiduLog' '百度网盘日志' '百度网盘客户端与内核的日志（下载的文件不在此列）' 'DirContent' @(
+        "$ad\baidu\BaiduNetdisk\logs", "$ad\baidu\BaiduNetdisk\log",
+        "$la\baidu\BaiduNetdisk\logs", "$la\baidu\BaiduNetdisk\log",
+        "$ad\baidu\BaiduYunKernel\logs", "$la\baidu\BaiduYunKernel\logs",
+        "$pd\baidu\BaiduNetdisk\logs"
+    ) '低' $true $false))
+    # Visual Studio 的日志。**刻意不列 %TEMP%**：整个 %TEMP% 已由「用户临时文件」覆盖，
+    # 再列一次会让同一批文件被两项重复计入（VS 安装器的 dd_*.log 就在 %TEMP% 下）。
+    # 活动日志是文件而不是目录，所以这一项用 RemoveDir（对文件与目录都能删）。
+    # 只用 ActivityLog*.xml 一条通配符即可同时覆盖 ActivityLog.xml 与 ActivityLog.Setup.xml，
+    # 不要再单列一条精确名，否则同一文件会被匹配两次。
+    # 本机实测：ActivityLog.Setup.xml 2.13 MB。
+    [void]$list.Add((New-Entry 'VSLogs' 'Visual Studio 日志' 'VS 与安装程序的活动日志、遥测缓存' 'RemoveDir' @(
+        "$ad\Microsoft\VisualStudio\*\ActivityLog*.xml",
+        "$la\Microsoft\VisualStudio\*\SettingsLogs",
+        "$la\Microsoft\VisualStudio\*\Logs",
+        "$la\Microsoft\VSApplicationInsights"
+    ) '低' $true $false))
+
     # ---------- 中风险 ----------
     [void]$list.Add((New-Entry 'MavenGradle' 'Maven / Gradle 本地仓库' 'Java 依赖本地仓库，删除后下次构建会重新下载（可能很久）' 'DirContent' @("$up\.m2\repository", "$up\.gradle\caches") '中' $false $false))
     [void]$list.Add((New-Entry 'WinUpdate' 'Windows 更新缓存' '已下载的更新安装包，不影响已经装好的更新' 'DirContent' @("$win\SoftwareDistribution\Download") '中' $false $true))
@@ -557,7 +621,10 @@ function Get-Catalog {
     [void]$list.Add((New-Entry 'FontCache' '字体缓存' '系统字体缓存，删除后会自动重建' 'DirContent' @("$win\ServiceProfiles\LocalService\AppData\Local\FontCache") '中' $false $true))
     [void]$list.Add((New-Entry 'NvShader' 'NVIDIA 着色器缓存' '显卡着色器缓存，删除后游戏首次加载略慢' 'DirContent' @("$la\NVIDIA\DXCache", "$la\NVIDIA\GLCache", "$pd\NVIDIA Corporation\NV_Cache") '中' $false $false))
     [void]$list.Add((New-Entry 'NvInstaller' 'NVIDIA 安装包缓存' 'NVIDIA App 下载的驱动安装包残留' 'RemoveDir' @("$pd\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts") '中' $false $true))
-    [void]$list.Add((New-Entry 'PkgCache' '安装包缓存 (Package Cache)' 'VS / VC++ 运行库安装缓存，删除后修复或卸载软件时可能要重下' 'DirContent' @("$pd\Package Cache") '中' $false $true))
+    # 安装包缓存。系统级那半在 %ProgramData%\Package Cache（VS / VC++ / .NET 等的安装包负载，
+    # 本机实测 292.9 MB），用户级那半在 %LOCALAPPDATA%\Package Cache（本机实测 25.2 MB）——
+    # 只列系统级会漏掉用户级，两者路径不重叠，所以一并计入。
+    [void]$list.Add((New-Entry 'PkgCache' '安装包缓存 (Package Cache)' 'VS / VC++ 安装缓存，删除后修复或卸载软件时可能要重下' 'DirContent' @("$pd\Package Cache", "$la\Package Cache") '中' $false $true))
     [void]$list.Add((New-Entry 'EventLog' '系统事件日志' '清空事件查看器中的日志内容' 'EventLog' @() '中' $false $true))
     [void]$list.Add((New-Entry 'Dism' 'Windows 组件清理 (DISM)' '清理 WinSxS 中的旧组件，耗时较长，清理后无法回滚已装更新' 'Dism' @() '中' $false $true))
     [void]$list.Add((New-Entry 'AdobeMediaCache' 'Adobe 媒体缓存' 'Premiere / After Effects 等生成的媒体缓存，删除后需重新生成' 'DirContent' @(
@@ -583,6 +650,52 @@ function Get-Catalog {
         "$pd\Microsoft\Windows\Caches"
     ) '中' $false $true))
 
+    # 实时内核报告：显卡 / 驱动挂起时系统写下的转储，成对出现（.dmp + 同名 .xml），动辄上 GB。
+    # 与另两项的分工：程序崩溃的 .dmp 归低风险的「崩溃转储文件」（%LOCALAPPDATA%\CrashDumps），
+    # 蓝屏的 C:\MEMORY.DMP 与 Windows\Minidump 归高风险的「内存转储文件」——三处路径互不重叠，
+    # 所以这里只补 LiveKernelReports，不重复计另外两处。
+    [void]$list.Add((New-Entry 'LiveKernelDump' '实时内核报告' '显卡或驱动挂起时写下的实时内核转储，排查驱动问题用' 'DirContent' @("$win\LiveKernelReports") '中' $false $true))
+
+    # Windows Defender 的缓存与旧特征库。
+    # **刻意只挑非关键目录**：当前生效的特征库放在 Definition Updates 下的一个 GUID 目录里
+    # （本机实测 215.2 MB），删掉整个 Definition Updates 会让 Defender 当场失去当前特征库，
+    # 只能靠引擎自带的基础特征顶着，直到重新下载完——所以只清理备份、暂存、引擎日志与安全中心缓存。
+    # Platform（引擎二进制）、Quarantine（隔离区，删了就无法还原被误杀的隔离文件）、
+    # LocalCopy 与 Features 都不动。本机实测可清出约 20 MB（引擎日志 18 MB + 安全中心缓存 2.1 MB）。
+    [void]$list.Add((New-Entry 'DefenderJunk' 'Windows Defender 缓存与旧特征库' '特征库备份、引擎日志与安全中心的缓存（当前特征库会保留）' 'DirContent' @(
+        "$pd\Microsoft\Windows Defender\Definition Updates\Backup",
+        "$pd\Microsoft\Windows Defender\Definition Updates\NisBackup",
+        "$pd\Microsoft\Windows Defender\Definition Updates\Updates",
+        "$pd\Microsoft\Windows Defender\Definition Updates\StableEngineEtwLocation",
+        "$pd\Microsoft\Windows Defender\Support",
+        "$pd\Microsoft\Windows Security Health"
+    ) '中' $false $true))
+
+    # 新版 Visual Studio 安装器的安装源缓存（VS 2017 以后把清单与引导程序缓存在 Packages 下）。
+    # **刻意不动 _Instances**：那个目录记录着「装了哪些 VS 实例、装在哪」，删掉之后
+    # 安装器的「修改 / 修复 / 卸载」会认不出已装的 VS。_Channels / _ChannelFeeds / _RemoteChannels
+    # 是频道清单，_LatestInstaller / _bootstrapper 是引导程序，都能重新下载。
+    # 真正的大头（VS / VC++ 的安装包负载）在 %ProgramData%\Package Cache，
+    # 已由「安装包缓存 (Package Cache)」单独一项负责，不在这里重复计。
+    # 本机实测：两个 _Channels 各 17.6 MB。
+    [void]$list.Add((New-Entry 'VSInstallerCache' 'Visual Studio 安装源缓存' '安装器下载的频道清单与引导程序缓存（安装状态记录会保留）' 'DirContent' @(
+        "$pd\Microsoft\VisualStudio\Packages\_Channels",
+        "$pd\Microsoft\VisualStudio\Packages\_ChannelFeeds",
+        "$pd\Microsoft\VisualStudio\Packages\_bootstrapper",
+        "$la\Microsoft\VisualStudio\Packages\_Channels",
+        "$la\Microsoft\VisualStudio\Packages\_ChannelFeeds",
+        "$la\Microsoft\VisualStudio\Packages\_RemoteChannels",
+        "$la\Microsoft\VisualStudio\Packages\_LatestInstaller"
+    ) '中' $false $true))
+
+    # Windows Defender 保护历史记录：Defender 的检测与处置记录，对应界面里的「保护历史记录」列表。
+    # 只删记录，不碰隔离区（Quarantine），所以被误杀的隔离文件仍然可以还原。
+    # 这一目录常被 Defender 占用，删除时可能有一部分文件删不掉，日志里会写明「仍有 N 项未能删除」。
+    # 本机因为没有检测记录，Scans 目录是空的（实测 0 B），所以在测试机上这一项读数为 0。
+    [void]$list.Add((New-Entry 'DefenderHistory' 'Windows Defender 保护历史记录' 'Defender 的检测与处置记录，删除后保护历史会清空' 'DirContent' @(
+        "$pd\Microsoft\Windows Defender\Scans\History"
+    ) '中' $false $true))
+
     # ---------- 高风险 ----------
     [void]$list.Add((New-Entry 'MemoryDump' '内存转储文件' 'C:\MEMORY.DMP 与 Minidump，排查蓝屏用' 'RemoveDir' @("$sd\MEMORY.DMP", "$win\Minidump") '高' $false $true))
     [void]$list.Add((New-Entry 'UpgradeLeftover' '系统升级残留目录' '$WINDOWS.~BT / $WINDOWS.~WS 升级临时目录，以及 $WinREAgent / $GetCurrent / Panther 安装残留' 'RemoveDir' @("$sd\`$WINDOWS.~BT", "$sd\`$WINDOWS.~WS", "$sd\`$WinREAgent", "$sd\`$GetCurrent", "$win\Panther") '高' $false $true))
@@ -593,14 +706,94 @@ function Get-Catalog {
     return $list
 }
 
+# 「这个路径确实不存在」——返回 $true 才是确定不存在，返回 $false 表示「存在，或者判断不了」。
+#
+# 为什么不直接用 Test-Path / File.Exists / Directory.Exists：
+# 这三者在权限不足时**返回 $false 而不是抛异常**，于是「存在但读不到」会被误判成「不存在」。
+# 本机实测两种情况都真实发生：
+#   · C:\hiberfil.sys —— 文件确实在（列盘根目录能看见、File.Exists 也是 True），
+#     但 Test-Path 恒为 false，而休眠开着时它可能有十几 GB；
+#   · C:\ProgramData\Microsoft\Windows Defender\Scans\History —— 父目录存在但 ACL 不允许列出，
+#     连 Directory.Exists 都返回 false。
+# 因此这里改成「从下往上找第一个能列出来的祖先目录，再看那一层有没有这个名字」：
+# 找得到名字就是存在；某一层列不出来就承认判断不了，按存在处理——
+# 宁可多显示一项（它会显示「需管理员」），也不要把本该出现的项悄悄藏掉。
+function Test-MxPathAbsent {
+    param([string]$Path)
+    $cur = $Path
+    for ($i = 0; $i -lt 12; $i++) {
+        $parent = [System.IO.Path]::GetDirectoryName($cur)
+        $leaf   = [System.IO.Path]::GetFileName($cur)
+        if ([string]::IsNullOrWhiteSpace($parent) -or [string]::IsNullOrWhiteSpace($leaf)) { return $false }
+        if ([System.IO.Directory]::Exists($parent)) {
+            try {
+                foreach ($d in [System.IO.Directory]::GetDirectories($parent)) {
+                    if ([System.IO.Path]::GetFileName($d) -ieq $leaf) { return $false }
+                }
+                foreach ($f in [System.IO.Directory]::GetFiles($parent)) {
+                    if ([System.IO.Path]::GetFileName($f) -ieq $leaf) { return $false }
+                }
+                return $true      # 这一层能列出来、且确实没有这个名字
+            } catch {
+                return $false     # 列不出来 -> 判断不了
+            }
+        }
+        $cur = $parent        # 父目录不存在（或同样读不到）-> 继续往上找
+    }
+    return $false
+}
+
+# 判断一个清理项在本机是否「适用」。
+# 判据只看存不存在，不看当前体积：
+#   · 目录存在、但此刻正好是空的（例如刚清理完、或程序刚装还没产生缓存）→ 仍然算适用，
+#     因为下一轮扫描它会有内容，提前把它藏掉反而让人以为功能没了；
+#   · 目录压根不存在 → 说明对应软件/功能不在本机（没装 Office、没有 NVIDIA 显卡、
+#     没升级过系统所以没有 Windows.old……），这一项就没必要出现在列表里。
+# 少数几类不按路径判断：回收站、事件日志、DISM、系统还原点在所有 Windows 上都存在；
+# 休眠文件的判据是 hiberfil.sys 在不在（休眠关掉时它本来就不在，而且它读不到，见上面说明）。
+function Test-MxEntryApplicable {
+    param($Entry)
+    switch ($Entry.Kind) {
+        'RecycleBin'   { return $true }
+        'EventLog'     { return $true }
+        'Dism'         { return $true }
+        'RestorePoint' { return $true }
+        'Hibernate'    { return (-not (Test-MxPathAbsent -Path (Join-Path $env:SystemDrive 'hiberfil.sys'))) }
+    }
+    if ($null -eq $Entry.Targets -or $Entry.Targets.Count -eq 0) { return $true }
+    # 快路径：能解析到路径就是适用（Expand-Targets 负责通配符）
+    if (@(Expand-Targets $Entry.Targets).Count -gt 0) { return $true }
+    # 解析不到时再用 Test-MxPathAbsent 复核一遍确属「不存在」；
+    # 只要有一条目标判断不了，就按适用处理，不藏。
+    foreach ($t in $Entry.Targets) {
+        $e = [System.Environment]::ExpandEnvironmentVariables($t)
+        if ($e -match '[\*\?]') { continue }     # 通配符那条已经由 Expand-Targets 查过
+        if (-not (Test-MxPathAbsent -Path $e)) { return $true }
+    }
+    return $false
+}
+
 function Initialize-Entries {
     param($Config)
     $script:Entries.Clear()
+    $script:MxHiddenEntries.Clear()
     foreach ($e in (Get-Catalog)) {
         if ($Config -and $Config.Selected -and $Config.Selected.ContainsKey($e.Id)) {
             $e.Selected = [bool]$Config.Selected[$e.Id]
         }
+        # 本机不适用的项直接不进列表：列表、汇总、环形图、扫描、清理都是按
+        # $script:Entries 走的，这里过滤一次，下游各处不必再各自判断一遍。
+        if (-not (Test-MxEntryApplicable -Entry $e)) {
+            [void]$script:MxHiddenEntries.Add($e)
+            continue
+        }
         [void]$script:Entries.Add($e)
+    }
+    # 只在界面上给一个短提示，明细（哪些项、为什么）写进日志，
+    # 免得用户发现某项「不见了」却找不到原因。
+    $script:MxMetaHidden = ''
+    if ($script:MxHiddenEntries.Count -gt 0) {
+        $script:MxMetaHidden = ('  ·  已隐藏 ' + $script:MxHiddenEntries.Count + ' 项')
     }
 }
 
@@ -763,7 +956,7 @@ function Measure-Entry {
             foreach ($p in (Expand-Targets $Entry.Targets)) {
                 $sum += Get-PathSize $p
                 if ($swY.ElapsedMilliseconds -ge 20) {
-                    [System.Windows.Forms.Application]::DoEvents()
+                    Invoke-MxPump
                     $swY.Restart()
                 }
             }
@@ -2089,9 +2282,11 @@ function Show-Gui {
     $lblListMeta.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
     $lblListMeta.BackColor = [System.Drawing.Color]::Transparent
     $lblListMeta.TextAlign = 'MiddleRight'
+    # 宽度仍是 320：多带一段「已隐藏 N 项」后，最长的一串
+    # （共 43 项 · 扫描 8.42 秒 · 已隐藏 12 项）实测也就 230 像素，右对齐放得下。
     $lblListMeta.Location = New-Object System.Drawing.Point(($COL_RW - (MxU 24) - (MxU 320)), (MxU 16))
     $lblListMeta.Size = New-Object System.Drawing.Size((MxU 320), (MxU 18))
-    $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项')
+    $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项' + $script:MxMetaHidden)
     $cardList.Controls.Add($lblListMeta)
 
     $LIST_TOP = MxU 46
@@ -2634,7 +2829,7 @@ function Show-Gui {
             Update-MxSummary
             $note = ''
             if ($deferred -gt 0) { $note = '，另有 ' + $deferred + ' 项在后台计算' }
-            $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项  ·  扫描 ' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒')
+            $lblListMeta.Text = ('共 ' + $script:Entries.Count + ' 项  ·  扫描 ' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒' + $script:MxMetaHidden)
             Write-Log ('扫描完成：' + [math]::Round($script:MxLastScanMs / 1000, 2) + ' 秒' + $note)
         } finally {
             $script:MxScanning = $false
@@ -2776,18 +2971,251 @@ function Show-Gui {
         return
     }
 
-    # ---- 启动动画：线条描绘的兽爪 ----
-    # 逐段「画」出一只兽爪：先掌垫，再四枚椭圆脚趾（内高外低、扇形外倾）。
-    # 每条路径预先算好累计长度，绘制时按总进度依次推进，所以是「画」出来而不是整体淡入。
-    # 画完稍作停留后向中心收拢消失，收场不会让界面突然跳出；动画期间点一下可立即跳过。
-    $script:MxClawPhase = 'idle'     # idle / draw / hold / fade
-    $script:MxClawDraw  = [double]0  # 描绘进度 0..1
-    $script:MxClawHold  = [double]0  # 停留计时（秒）
-    $script:MxClawFade  = [double]0  # 收拢进度 0..1
-    $script:MxClawSecDraw = 1.05
-    $script:MxClawSecHold = 0.30
-    $script:MxClawSecFade = 0.42
+    # ---- 启动动画的 C# 渲染器 ----
+    # 入场动画的绘制（相机角度、透视除法、18 层深度轮廓、按弧长描绘、玻璃面、扫光）都放在一个
+    # C# 类型里，比在 PowerShell 里逐点算快得多：150 帧实测整块面板重画中位 2.4 毫秒。
+    # 源码直接内嵌编译（Add-Type -TypeDefinition），主程序因此仍是单文件，不必把 .cs 一起分发；
+    # 独立源码见「启动动画-交接/SplashRenderer.cs」，两边改动要同步。
+    # 编译实测约 85 毫秒（只在类型尚未载入时编译一次）。万一编译失败，只是没有启动动画，程序照常可用。
+    $script:MxClawRendererCs = @'
+            using System;
+            using System.Collections.Generic;
+            using System.Drawing;
+            using System.Drawing.Drawing2D;
+
+            // The supplied paths remain in model space. Only the camera and reveal change.
+            public sealed class ClawFrame
+            {
+                public double Draw, Scale, Yaw, Pitch, Angle, Depth, Body, Shine, Text, Fade;
+            }
+
+            public static class ClawRenderer
+            {
+                public const double IgniteEnd = .3, BuildEnd = 1.4, RevealEnd = 2.9, SnapEnd = 3.4, End = 4.6, FadeDuration = .4;
+                static double Clamp(double x) { return Math.Max(0, Math.Min(1, x)); }
+                static double Smooth(double x) { x = Clamp(x); return x * x * (3 - 2 * x); }
+                static double Lerp(double a, double b, double t) { return a + (b - a) * t; }
+
+                public static ClawFrame State(double t, double fade)
+                {
+                    t = Math.Max(0, t);
+                    double turn = Smooth((t - 2.65) / .80);
+                    double settle = Smooth((t - SnapEnd) / (End - SnapEnd));
+                    double scale = t < .9 ? Lerp(1.35, 2.30, Smooth(t / .9)) : 2.30;
+                    if (t >= RevealEnd) scale = Lerp(2.30, 1.12, Smooth((t - RevealEnd) / (SnapEnd - RevealEnd)));
+                    if (t >= SnapEnd) scale = Lerp(1.12, 1, settle);
+                    return new ClawFrame {
+                        Draw = t < .3 ? .028 * Smooth(t / .3) : Lerp(.028, 1, Smooth((t - .3) / 2.5)),
+                        Scale = scale * (1 - .08 * Smooth(fade)),
+                        Yaw = Lerp(28, 0, turn), Pitch = Lerp(-8, 0, turn),
+                        Angle = Lerp(-10, 0, turn),
+                        Depth = .27 * Smooth(t / .9) * (1 - turn),
+                        Body = Smooth((t - 1.35) / 1.6),
+                        Shine = t < 1.4 ? -1 : (t < 2.6 ? (t - 1.4) / 1.2 :
+                            (t < 3.6 ? (t - 2.6) / 1.0 : (t - 3.6) / .65)),
+                        Text = Smooth((t - 3.35) / .40), Fade = 1 - Smooth(fade)
+                    };
+                }
+
+                static Color Ink(int alpha, int r, int g, int b, double fade)
+                { return Color.FromArgb((int)Math.Round(Math.Max(0, Math.Min(255, alpha * fade))), r, g, b); }
+
+                static PointF Project(PointF p, double z, ClawFrame f, double cx, double cy, double size)
+                {
+                    double x = (p.X - cx) / size, y = (p.Y - cy) / size;
+                    double yaw = f.Yaw * Math.PI / 180, pitch = f.Pitch * Math.PI / 180;
+                    double rx = x * Math.Cos(yaw) + z * Math.Sin(yaw);
+                    double rz = -x * Math.Sin(yaw) + z * Math.Cos(yaw);
+                    double ry = y * Math.Cos(pitch) - rz * Math.Sin(pitch);
+                    rz = y * Math.Sin(pitch) + rz * Math.Cos(pitch);
+                    double a = f.Angle * Math.PI / 180;
+                    double perspective = 3.8 / (3.8 + rz);
+                    double px = (rx * Math.Cos(a) - ry * Math.Sin(a)) * perspective;
+                    double py = (rx * Math.Sin(a) + ry * Math.Cos(a)) * perspective;
+                    return new PointF((float)(cx + px * size * f.Scale), (float)(cy + py * size * f.Scale));
+                }
+
+                // Arc length, rather than sample count, keeps the tracing speed uniform.
+                static PointF[] Trace(PointF[] source, double progress)
+                {
+                    if (progress <= 0) return new PointF[0];
+                    if (progress >= 1) return source;
+                    double total = 0;
+                    for (int i = 1; i < source.Length; i++) total += Distance(source[i - 1], source[i]);
+                    double remaining = total * progress;
+                    var points = new List<PointF>();
+                    points.Add(source[0]);
+                    for (int i = 1; i < source.Length; i++) {
+                        double length = Distance(source[i - 1], source[i]);
+                        if (remaining >= length) { points.Add(source[i]); remaining -= length; }
+                        else {
+                            double u = length > 0 ? remaining / length : 0;
+                            points.Add(new PointF((float)Lerp(source[i - 1].X, source[i].X, u),
+                                (float)Lerp(source[i - 1].Y, source[i].Y, u)));
+                            break;
+                        }
+                    }
+                    return points.ToArray();
+                }
+                static double Distance(PointF a, PointF b)
+                { double x = b.X - a.X, y = b.Y - a.Y; return Math.Sqrt(x * x + y * y); }
+
+                static GraphicsPath Path(PointF[] points, double z, ClawFrame frame, double cx, double cy, double size, bool closed)
+                {
+                    var path = new GraphicsPath();
+                    if (points.Length < 2) return path;
+                    var projected = new PointF[points.Length];
+                    for (int i = 0; i < points.Length; i++) projected[i] = Project(points[i], z, frame, cx, cy, size);
+                    path.AddLines(projected);
+                    if (closed) path.CloseFigure();
+                    return path;
+                }
+
+                static void Glow(Graphics g, PointF center, float radius, Color color)
+                {
+                    if (radius <= 0 || color.A == 0) return;
+                    using (var path = new GraphicsPath()) {
+                        path.AddEllipse(center.X - radius, center.Y - radius, radius * 2, radius * 2);
+                        using (var brush = new PathGradientBrush(path)) {
+                            brush.CenterColor = color;
+                            brush.SurroundColors = new [] { Color.FromArgb(0, color.R, color.G, color.B) };
+                            g.FillPath(brush, path);
+                        }
+                    }
+                }
+
+                public static void Draw(Graphics g, PointF[][] source, ClawFrame f, double cx, double cy, double size)
+                {
+                    if (f.Draw <= 0 || f.Fade <= 0) return;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    double unit = size / 212.0;
+                    double[] starts = { .18, .14, 0, .22, .40 };
+                    double[] spans = { .79, .57, .62, .58, .60 };
+                    double topY = double.MaxValue, bottomY = double.MinValue;
+                    foreach (PointF[] contour in source) foreach (PointF point in contour) {
+                        PointF projected = Project(point, 0, f, cx, cy, size);
+                        topY = Math.Min(topY, projected.Y);
+                        bottomY = Math.Max(bottomY, projected.Y);
+                    }
+                    var glassBounds = new RectangleF((float)(cx - size * f.Scale), (float)(topY - 2),
+                        (float)(2 * size * f.Scale), (float)(bottomY - topY + 4));
+                    var progress = new double[source.Length];
+                    for (int i = 0; i < source.Length; i++) progress[i] = Clamp((f.Draw - starts[i]) / spans[i]);
+                    var center = new PointF((float)cx, (float)cy);
+                    Glow(g, center, (float)(size * f.Scale * .66), Ink((int)(18 * f.Body), 150, 192, 240, f.Fade));
+
+                    // Parallel contours are separate depth slices, not offset copies in screen space.
+                    for (int layer = 18; layer >= 1; layer--) {
+                        double depth = f.Depth * layer / 18.0;
+                        if (depth < .001) continue;
+                        using (var pen = new Pen(Ink((int)(36 * (1 - layer / 25.0)), 126, 169, 218, f.Fade), (float)(.85 * unit))) {
+                            pen.LineJoin = LineJoin.Round;
+                            for (int i = 0; i < source.Length; i++) {
+                                double q = Clamp(progress[i] - layer * .006 * (1 - f.Body));
+                                using (var path = Path(Trace(source[i], q), depth, f, cx, cy, size, q >= 1)) {
+                                    if (path.PointCount > 1) g.DrawPath(pen, path);
+                                }
+                            }
+                        }
+                    }
+
+                    using (var filled = new GraphicsPath(FillMode.Winding)) {
+                        for (int i = 0; i < source.Length; i++) {
+                            using (var silhouette = Path(Trace(source[i], progress[i]), 0, f, cx, cy, size, true)) {
+                                // The traced arc encloses a growing glass lens, without a horizontal wipe edge.
+                                if (silhouette.PointCount > 2) {
+                                    double opacity = Smooth(progress[i] / .7) * f.Fade;
+                                    using (var brush = new LinearGradientBrush(glassBounds,
+                                        Ink((int)Lerp(45, 229, f.Body), 216, 232, 250, opacity),
+                                        Ink((int)Lerp(65, 255, f.Body), 148, 178, 216, opacity), 90)) {
+                                        brush.WrapMode = WrapMode.TileFlipXY;
+                                        g.FillPath(brush, silhouette);
+                                    }
+                                    filled.AddPath(silhouette, false);
+                                }
+                            }
+                            PointF[] trace = Trace(source[i], progress[i]);
+                            using (var path = Path(trace, 0, f, cx, cy, size, progress[i] >= 1)) {
+                                if (path.PointCount < 2) continue;
+                                using (var edge = new Pen(Ink(78, 150, 178, 214, f.Fade), (float)(10 * unit))) {
+                                    edge.LineJoin = LineJoin.Round; edge.StartCap = edge.EndCap = LineCap.Round;
+                                    g.DrawPath(edge, path);
+                                }
+                                using (var edge = new Pen(Ink(228, 255, 255, 255, f.Fade), (float)(2.6 * unit))) {
+                                    edge.LineJoin = LineJoin.Round; edge.StartCap = edge.EndCap = LineCap.Round;
+                                    g.DrawPath(edge, path);
+                                }
+                                if (progress[i] > 0 && progress[i] < 1) {
+                                    PointF head = Project(trace[trace.Length - 1], 0, f, cx, cy, size);
+                                    Glow(g, head, (float)(20 * unit), Ink(160, 172, 208, 246, f.Fade));
+                                    Glow(g, head, (float)(9 * unit), Ink(240, 255, 255, 255, f.Fade));
+                                }
+                            }
+                        }
+                        // Broad travelling reflection: three passes follow the reference's material reveal.
+                        if (filled.PointCount > 0 && f.Shine >= 0 && f.Shine <= 1) {
+                            GraphicsState saved = g.Save();
+                            g.SetClip(filled, CombineMode.Intersect);
+                            float x = (float)(cx + (f.Shine * 2 - 1) * size * f.Scale * .95);
+                            float half = (float)(size * f.Scale * .17);
+                            float slope = (float)(size * f.Scale * .14);
+                            float top = (float)(cy - size * f.Scale), bottom = (float)(cy + size * f.Scale);
+                            PointF[] band = { new PointF(x-half+slope,top), new PointF(x+half+slope,top),
+                                new PointF(x+half-slope,bottom), new PointF(x-half-slope,bottom) };
+                            using (var brush = new LinearGradientBrush(new PointF(x-half, (float)cy), new PointF(x+half,(float)cy), Color.Transparent, Color.White)) {
+                                var blend = new ColorBlend(3);
+                                blend.Colors = new [] { Color.Transparent, Ink(180,255,255,255,f.Fade), Color.Transparent };
+                                blend.Positions = new float[] { 0, .5f, 1 };
+                                brush.InterpolationColors = blend;
+                                g.FillPolygon(brush, band);
+                            }
+                            g.Restore(saved);
+                        }
+                    }
+                }
+            }
+
+'@
+    try {
+        if (-not ('ClawRenderer' -as [type])) {
+            Add-Type -TypeDefinition $script:MxClawRendererCs -ReferencedAssemblies System.Drawing -ErrorAction Stop
+        }
+        $script:MxClawRendererReady = $true
+    } catch {
+        $script:MxClawRendererReady = $false
+    }
+    # ---- 启动动画：液态玻璃兽爪「点亮 — 近景生长 — 巨幅成形 — 骤收 — 落定」 ----
+    # 动作骨架取自用户提供的本地参考视频（3840x2160 / 30fps / 273 帧）。
+    # 原片不是「中心竖条横向展开」：它先点亮一小段弧线，轮廓一边描绘一边持续向镜头推进，
+    # 身后留下多层挤出的轮廓；主体在近景中完整成形后，于约 0.3 秒内迅速缩到最终尺寸，
+    # 随后亮面扫过并稳定。主要动作按参考片前 4.2 秒展开，4.6 秒开始收场。
+    # 原片是「深红渐变底 + 三层金（淡金/金/橙）+ 白热笔头」，本项目沿用白色主题，
+    # 因此只取动作骨架，把材质换成液态玻璃：背后柔光 + 投影 + 半透明玻璃体 +
+    # 冷色折射边 + 白色镜面高光边；近景描完后凝成整块玻璃，再有一道镜面扫过，
+    # 最后落下工作室名称。
+    # 兽爪几何（三段圆弧拼出的掌垫 + 四枚脚趾）完全沿用，未改任何控制点。
+    $script:MxStudio = '林中晨曦工作室'
+    $script:MxClawPhase = 'idle'     # idle / run / fade
+    $script:MxClawT     = [double]0  # run 阶段累计秒数
+    $script:MxClawFade  = [double]0  # 收场进度 0..1
+    # 时间轴来自渲染器的常量，合计 4.6 秒 + 0.4 秒收场。
+    if ($script:MxClawRendererReady) {
+        $script:MxClawTIgnite = [ClawRenderer]::IgniteEnd
+        $script:MxClawTBuild  = [ClawRenderer]::BuildEnd - [ClawRenderer]::IgniteEnd
+        $script:MxClawTReveal = [ClawRenderer]::RevealEnd - [ClawRenderer]::BuildEnd
+        $script:MxClawTSnap   = [ClawRenderer]::SnapEnd - [ClawRenderer]::RevealEnd
+        $script:MxClawTHold   = [ClawRenderer]::End - [ClawRenderer]::SnapEnd
+        $script:MxClawTFade   = [ClawRenderer]::FadeDuration
+    } else {
+        # 渲染器没编译起来：时长整体归零，动画会被跳过，程序照常可用
+        $script:MxClawTIgnite = [double]0; $script:MxClawTBuild = [double]0
+        $script:MxClawTReveal = [double]0; $script:MxClawTSnap  = [double]0
+        $script:MxClawTHold = [double]0; $script:MxClawTFade  = [double]0
+    }
+    # 长稳定结束的时刻：五项相加，写成表达式以免以后调时长时对不上
+    $script:MxClawTEnd = [double]($script:MxClawTIgnite + $script:MxClawTBuild + $script:MxClawTReveal + $script:MxClawTSnap + $script:MxClawTHold)
     $script:MxClawCache = $null
+    $script:MxClawFont  = $null
 
     # 椭圆展平为折线；$Rot 用于外侧脚趾的外倾
     function New-MxEllipsePoints {
@@ -2898,6 +3326,37 @@ function Show-Gui {
         return $paths
     }
 
+    # 缓动与夹取。整套动画的所有参数都从同一条时间轴推出来并集中在下面一个函数里，
+    # 自检才能按任意时间点定格渲染，不会出现「只有播放路径画得出来」的情况。
+    function MxRamp {
+        param([double]$x)
+        if ($x -lt 0.0) { return [double]0 }
+        if ($x -gt 1.0) { return [double]1 }
+        return $x
+    }
+    function MxEaseOut {
+        param([double]$x, [double]$p = 2.0)
+        return (1.0 - [Math]::Pow(1.0 - $x, $p))
+    }
+    function MxEaseIn {
+        param([double]$x, [double]$p = 2.0)
+        return [Math]::Pow($x, $p)
+    }
+    function MxEaseInOut {
+        param([double]$x)
+        return ($x * $x * (3.0 - 2.0 * $x))
+    }
+
+    # 由累计时间推出这一帧的全部参数 —— 都在 C# 渲染器里（ClawRenderer.State）。
+    # 状态只依赖累计秒数，因而实时播放、关键帧定格渲染与逐帧导出走同一条计算路径。
+    function Get-MxSplashState {
+        param([double]$T)
+        # 渲染器没编译起来时返回空对象：调用方取 .Draw 等属性得到 $null（转 [double] 即 0），
+        # 等于什么都不画，不会因此报错。注意 param 必须是函数体第一条语句，守护要写在它之后。
+        if (-not $script:MxClawRendererReady) { return (New-Object PSObject) }
+        return [ClawRenderer]::State($T, [double]$script:MxClawFade)
+    }
+
     # 路径缓存：尺寸不变则复用，避免每帧重算折线长度
     function Get-MxClawCache {
         param([int]$W, [int]$H)
@@ -2906,7 +3365,8 @@ function Show-Gui {
         }
         $S  = [Math]::Min(([double]$H * 0.34), ([double]$W * 0.18))
         $cx = $W / 2.0
-        $cy = ($H / 2.0) + $S * 0.06
+        # 下方要留落款的位置，所以爪心比面板中心略高一点，整组内容才居中
+        $cy = ($H / 2.0) - $S * 0.06
         $paths = Get-MxClawPaths -Cx $cx -Cy $cy -S $S
         $cums  = New-Object System.Collections.ArrayList
         $total = [double]0
@@ -2933,14 +3393,73 @@ function Show-Gui {
                 if ($q.Y -gt $y1) { $y1 = [double]$q.Y }
             }
         }
-        # 兽爪的外接矩形（留出描边与抗锯齿的余量）。
-        # 动画每帧只重画这一小块，而不是整块面板：面板有 1473×981 像素，
-        # 整块重画实测要 30-87 毫秒，正好把动画帧率压到二三十帧。
-        $mgn = [double](MxU 10)
+        # 玻璃体路径：把五条闭合回路并成一个 GraphicsPath，填充与剪裁都用它。
+        # 必须用 Winding —— 脚趾根部与掌垫本来就有极小重叠（内趾底边比掌垫顶边低约 0.02R），
+        # 默认的 Alternate 会把重叠处挖成洞。
+        $body = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $body.FillMode = [System.Drawing.Drawing2D.FillMode]::Winding
+        foreach ($p in $paths) {
+            # 注意用 @() 包一层：Get-MxClawPaths 返回时 PowerShell 会把里层集合摊平成
+            # PointF[] 数组（不是 ArrayList），数组没有 ToArray() 方法，直接调会抛异常。
+            $body.AddLines([System.Drawing.PointF[]]@($p))
+            $body.CloseFigure()
+        }
+
+        # 落款：字体与位置一次算好。爪的上下半高相同（都是 1.610R），
+        # 文字直接贴在几何外接框下方即可。
+        if ($null -ne $script:MxClawFont) { $script:MxClawFont.Dispose() }
+        $script:MxClawFont = New-MxFont -Size (MxUF 11.5)
+        $tmpBmp = New-Object System.Drawing.Bitmap(1, 1)
+        $tmpG = [System.Drawing.Graphics]::FromImage($tmpBmp)
+        $txtSz = $tmpG.MeasureString($script:MxStudio, $script:MxClawFont)
+        $tmpG.Dispose(); $tmpBmp.Dispose()
+        $txtW = [double]$txtSz.Width
+        $txtH = [double]$txtSz.Height
+        $txtY = [double]$y1 + [double](MxUF 26)
+        $txtX = [double]$cx - $txtW / 2.0
+        if ($txtX -lt (MxU 8)) { $txtX = [double](MxU 8) }
+        if (($txtX + $txtW) -gt ($W - (MxU 8))) { $txtX = [double]($W - (MxU 8)) - $txtW }
+
+        # 重画区：动画每帧只重画这一小块，而不是整块面板
+        # （面板 1473x981，整块重画实测要 30-87 毫秒，正好把帧率压到二三十帧）。
+        # 这里必须严格覆盖「所有会画出来的东西」，否则区域外的像素会停在
+        # 上一次整块重画时的状态，动画里就会出现一圈看得见的接缝：
+        #   爪几何（含过冲） / 背后柔光 / 投影 / 笔头光晕 / 落款文字
+        # 括号里的每个系数都与绘制代码一一对应，改动任何一处半径都要同步这里。
+        $ov    = 2.40
+        $rHalo = 0.78
+        $rShad = 0.60
+        $rHead = 0.19
+        $clawL = ($cx - $x0) / $S
+        $clawR = ($x1 - $cx) / $S
+        $clawT = ($cy - $y0) / $S
+        $clawB = ($y1 - $cy) / $S
+        # 笔头永远落在爪的轮廓上，所以它的光晕外伸 = 爪的外伸 + 光晕半径
+        $extL = [Math]::Max($clawL + $rHead, 0.05 + $rHalo)
+        $extR = [Math]::Max($clawR + $rHead + 0.10, 0.03 + $rShad)
+        $extT = [Math]::Max($clawT + $rHead, 0.07 + $rHalo)
+        $extB = [Math]::Max($clawB + $rHead + 0.24, 0.14 + $rShad)
+        $mgn  = [double](MxU 12)
+        $ix0 = $cx - $extL * $S * $ov - $mgn
+        $iy0 = $cy - $extT * $S * $ov - $mgn
+        $ix1 = $cx + $extR * $S * $ov + $mgn
+        $iy1 = $cy + $extB * $S * $ov + $mgn
+        $ix0 = [Math]::Min($ix0, $txtX - $mgn)
+        $ix1 = [Math]::Max($ix1, $txtX + $txtW + $mgn)
+        $iy1 = [Math]::Max($iy1, $txtY + $txtH + $mgn)
         $rect = New-Object System.Drawing.Rectangle(
-            [int][Math]::Floor($x0 - $mgn), [int][Math]::Floor($y0 - $mgn),
-            [int][Math]::Ceiling($x1 - $x0 + 2 * $mgn), [int][Math]::Ceiling($y1 - $y0 + 2 * $mgn))
-        $script:MxClawCache = [PSCustomObject]@{ W = $W; H = $H; Paths = $paths; Cums = $cums; Total = $total; S = $S; Rect = $rect }
+            [int][Math]::Floor($ix0), [int][Math]::Floor($iy0),
+            [int][Math]::Ceiling($ix1 - $ix0), [int][Math]::Ceiling($iy1 - $iy0))
+        $modelPaths = New-Object 'System.Drawing.PointF[][]' $paths.Count
+        for ($i = 0; $i -lt $paths.Count; $i++) {
+            $modelPaths[$i] = [System.Drawing.PointF[]]@($paths[$i])
+        }
+        $script:MxClawCache = [PSCustomObject]@{
+            ModelPaths = $modelPaths
+            W = $W; H = $H; Paths = $paths; Cums = $cums; Total = $total
+            S = $S; Cx = $cx; Cy = $cy; Body = $body; Rect = $rect
+            TextX = $txtX; TextY = $txtY; TextW = $txtW; TextH = $txtH
+        }
         return $script:MxClawCache
     }
 
@@ -2952,73 +3471,46 @@ function Show-Gui {
     $splashPanel.Cursor = 'Hand'
     Enable-DoubleBuffer $splashPanel
 
-    $splashPanel.add_Paint({
+    $paintSplash = {
         param($sender, $e)
         $g = $e.Graphics
-        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $g.Clear($sender.BackColor)
-
         $cache = Get-MxClawCache -W $sender.Width -H $sender.Height
-        $c  = Get-MxColor $script:Mx.Primary
-        $al = [int][Math]::Round(255 * (1.0 - [double]$script:MxClawFade))
-        if ($al -lt 0) { $al = 0 }
-        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb($al, $c.R, $c.G, $c.B), [single](MxUF 2.8))
-        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-        $pen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
-        $pen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
-
-        $budget = $cache.Total * [double]$script:MxClawDraw
-        for ($pIdx = 0; $pIdx -lt $cache.Paths.Count; $pIdx++) {
-            if ($budget -le 0) { break }
-            $pts = $cache.Paths[$pIdx]
-            $cum = $cache.Cums[$pIdx]
-            $pathLen = $cum[$cum.Count - 1]
-            $need = $budget
-            if ($need -gt $pathLen) { $need = $pathLen }
-            # 找到已走完的最后一个采样点，再补出半段，线条末端才平滑
-            $last = 0
-            for ($i = 1; $i -lt $cum.Count; $i++) {
-                if ($cum[$i] -le $need) { $last = $i } else { break }
-            }
-            $seg = New-Object System.Collections.ArrayList
-            for ($i = 0; $i -le $last; $i++) { [void]$seg.Add($pts[$i]) }
-            if ($last -lt ($pts.Count - 1) -and $need -gt $cum[$last]) {
-                $segLen = $cum[$last + 1] - $cum[$last]
-                if ($segLen -gt 0.0001) {
-                    $f  = ($need - $cum[$last]) / $segLen
-                    $px = [double]$pts[$last].X + ([double]$pts[$last + 1].X - [double]$pts[$last].X) * $f
-                    $py = [double]$pts[$last].Y + ([double]$pts[$last + 1].Y - [double]$pts[$last].Y) * $f
-                    [void]$seg.Add((New-Object System.Drawing.PointF([single]$px, [single]$py)))
-                }
-            }
-            if ($seg.Count -ge 2) { $g.DrawLines($pen, [System.Drawing.PointF[]]$seg.ToArray()) }
-            $budget -= $pathLen
+        $st = Get-MxSplashState -T ([double]$script:MxClawT)
+        if ($script:MxClawRendererReady) { [ClawRenderer]::Draw($g, $cache.ModelPaths, $st, $cache.Cx, $cache.Cy, $cache.S) }
+        $tv = [double]$st.Text * [double]$st.Fade
+        if ($tv -gt 0.001) {
+            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb([int](168 * $tv), 124, 136, 154))
+            $g.DrawString($script:MxStudio, $script:MxClawFont, $brush, [single]$cache.TextX, [single]$cache.TextY)
+            $brush.Dispose()
         }
-        $pen.Dispose()
 
         # 收场：整体向中心收拢后隐藏，界面不会突然跳出
         $fd = [double]$script:MxClawFade
-        if ($fd -gt 0) {
-            $k = 1.0 - $fd
-            if ($k -lt 0.02) { $k = 0.02 }
-            $rw = [single]($sender.Width * $k)
-            $rh = [single]($sender.Height * $k)
+        if ($fd -gt 0 -and -not $RenderTo) {
+            $fk = 1.0 - $fd
+            if ($fk -lt 0.02) { $fk = 0.02 }
+            $rw = [single]($sender.Width * $fk)
+            $rh = [single]($sender.Height * $fk)
             $rad = [double](MxU 24)
             $lim = ([Math]::Min($rw, $rh) / 2.0) - 1.0
             if ($rad -gt $lim) { $rad = $lim }
             if ($rad -lt 0) { $rad = 0 }
-            $rect = New-Object System.Drawing.RectangleF((($sender.Width - $rw) / 2.0), (($sender.Height - $rh) / 2.0), $rw, $rh)
-            $rp = New-RoundedPath -Rect $rect -Radius $rad
+            $frect = New-Object System.Drawing.RectangleF((($sender.Width - $rw) / 2.0), (($sender.Height - $rh) / 2.0), $rw, $rh)
+            $rp = New-RoundedPath -Rect $frect -Radius $rad
             $sender.Region = New-Object System.Drawing.Region($rp)
             $rp.Dispose()
         }
-    })
+    }
+    $splashPanel.add_Paint($paintSplash)
     $root.Controls.Add($splashPanel)
 
     $script:MxSplashTimer = New-Object System.Windows.Forms.Timer
     $script:MxSplashTimer.Interval = 16
     # 进度按真实经过时间推进，而不是每帧固定加 16ms：
     # 定时器在扫描期间会被拖慢，按帧累加会让动画整体变慢、与设定时长不符。
+    # 现在整条时间线只由一个累计秒数 $script:MxClawT 驱动，画面参数全部从它推出来
+    # （见 Get-MxSplashState），所以「播放」和「自检定格渲染」走的是同一条计算路径。
     $script:MxClawWatch = New-Object System.Diagnostics.Stopwatch
     $script:MxClawLast  = [double]0
     $script:MxSplashTimer.add_Tick({
@@ -3027,18 +3519,15 @@ function Show-Gui {
         $script:MxClawLast = $now
         if ($dt -lt 0) { $dt = 0 }
         if ($dt -gt 0.25) { $dt = 0.25 }
-        if ($script:MxClawPhase -eq 'draw') {
-            $script:MxClawDraw += $dt / $script:MxClawSecDraw
-            if ($script:MxClawDraw -ge 1.0) {
-                $script:MxClawDraw  = [double]1.0
-                $script:MxClawPhase = 'hold'
-                $script:MxClawHold  = [double]0.0
+        if ($script:MxClawPhase -eq 'run') {
+            $script:MxClawT += $dt
+            if ($script:MxClawT -ge $script:MxClawTEnd) {
+                $script:MxClawT     = [double]$script:MxClawTEnd
+                $script:MxClawPhase = 'fade'
+                $script:MxClawFade  = [double]0.0
             }
-        } elseif ($script:MxClawPhase -eq 'hold') {
-            $script:MxClawHold += $dt
-            if ($script:MxClawHold -ge $script:MxClawSecHold) { $script:MxClawPhase = 'fade' }
         } elseif ($script:MxClawPhase -eq 'fade') {
-            $script:MxClawFade += $dt / $script:MxClawSecFade
+            $script:MxClawFade += $dt / $script:MxClawTFade
             if ($script:MxClawFade -ge 1.0) {
                 $script:MxClawFade  = [double]1.0
                 $script:MxClawPhase = 'idle'
@@ -3060,9 +3549,9 @@ function Show-Gui {
     })
 
     function Start-MxSplash {
-        $script:MxClawPhase  = 'draw'
-        $script:MxClawDraw   = [double]0
-        $script:MxClawHold   = [double]0
+        if (-not $script:MxClawRendererReady) { return }
+        $script:MxClawPhase  = 'run'
+        $script:MxClawT      = [double]0
         $script:MxClawFade   = [double]0
         $splashPanel.Region  = $null
         $splashPanel.Visible = $true
@@ -3073,11 +3562,11 @@ function Show-Gui {
         $script:MxSplashTimer.Start()
     }
 
-    # 点一下即可跳过：直接进入收场
+    # 点一下即可跳过：直接跳到长稳定结束，进入收场
     $splashPanel.add_MouseUp({
         param($sender, $e)
-        if ($script:MxClawPhase -eq 'draw' -or $script:MxClawPhase -eq 'hold') {
-            $script:MxClawDraw  = [double]1.0
+        if ($script:MxClawPhase -eq 'run') {
+            $script:MxClawT     = [double]$script:MxClawTEnd
             $script:MxClawPhase = 'fade'
             $script:MxClawFade  = [double]0.0
         }
@@ -3145,16 +3634,27 @@ function Show-Gui {
         $script:MxChartHover = -1
         $script:MxChartAct   = @([double]0, [double]0, [double]0, [double]0)
 
-        # 启动动画：输出兽爪描绘的三个阶段，用于核对线条形态与推进是否正常。
+        # 启动动画：按时间轴定格输出五帧，覆盖点亮 / 近景生长 / 巨幅成形 / 骤收 / 落定。
+        # 面板本身就是按 $script:MxClawT 推参数的，所以这里只要设好时间点就能重现任意一帧，
+        # 不必真的等待播放。
         # 注意：DrawToBitmap 绘制重叠子控件的顺序与 z 序不一致（最顶层反而先画、被后画的盖住），
         # 所以这里不直接截整窗，而是「先截主界面、再把面板单独绘制后叠上去」，结果与真实层叠一致。
+        Write-Host ('splash timeline: 点亮0-' + $script:MxClawTIgnite + 's  近景生长至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild) + 's  巨幅成形至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild + [double]$script:MxClawTReveal) + 's  骤收至' + ([double]$script:MxClawTIgnite + [double]$script:MxClawTBuild + [double]$script:MxClawTReveal + [double]$script:MxClawTSnap) + 's  落定至' + $script:MxClawTEnd + 's  收场共' + ($script:MxClawTEnd + $script:MxClawTFade) + 's')
         $splashPanel.Visible = $true
         $splashPanel.BringToFront()
-        foreach ($frame in @(@{ P = 0.22; S = '_splash_early' }, @{ P = 0.55; S = '_splash_mid' }, @{ P = 1.00; S = '_splash' })) {
+        $splashFrames = @(
+            @{ T = 0.30; S = '_splash_ignite' },
+            @{ T = 1.50; S = '_splash_build' },
+            @{ T = 2.80; S = '_splash_reveal' },
+            @{ T = 3.30; S = '_splash_snap' },
+            @{ T = 4.60; S = '_splash' }
+        )
+        foreach ($frame in $splashFrames) {
             $script:MxClawPhase  = 'idle'
-            $script:MxClawDraw   = [double]$frame.P
-            $script:MxClawHold   = [double]0
+            $script:MxClawT      = [double]$frame.T
             $script:MxClawFade   = [double]0
+            $sc = Get-MxSplashState -T ([double]$frame.T)
+            Write-Host ('  t=' + $frame.T + 's  推进=' + [Math]::Round([double]$sc.Draw, 3) + '  缩放=' + [Math]::Round([double]$sc.Scale, 3) + '  压扁=' + [Math]::Round([double]$sc.Squash, 3) + '  玻璃体=' + [Math]::Round([double]$sc.Body, 3) + '  笔头=' + [Math]::Round([double]$sc.Head, 3) + '  柔光=' + [Math]::Round([double]$sc.Halo, 3) + '  镜面=' + [Math]::Round([double]$sc.Shine, 3) + '  落款=' + [Math]::Round([double]$sc.Text, 3))
             $splashPanel.Region  = $null
             $splashPanel.Visible = $false
             $splashPanel.Invalidate()
@@ -3181,6 +3681,26 @@ function Show-Gui {
             $bmpSplash.Save($splashOut, [System.Drawing.Imaging.ImageFormat]::Png)
             $bmpSplash.Dispose()
             Write-Host ('splash rendered -> ' + $splashOut)
+        }
+        $splashPanel.Visible = $false
+
+        # 单帧耗时：用 Invalidate(小区域) + Update() 强制同步重绘来量，
+        # 与动画每帧真实做的事完全一致（DrawToBitmap 还要额外整块位图拷贝，会虚高）。
+        $script:MxClawCache = $null
+        $refCache = Get-MxClawCache -W $splashPanel.Width -H $splashPanel.Height
+        $splashPanel.Visible = $true
+        foreach ($probe in @(@{ T = 0.30; S = '点亮' }, @{ T = 1.50; S = '近景生长' }, @{ T = 2.80; S = '巨幅成形' }, @{ T = 4.60; S = '落定' })) {
+            $script:MxClawT = [double]$probe.T
+            $splashPanel.Invalidate($refCache.Rect)
+            $splashPanel.Update()
+            $n = 20
+            $swPaint = [System.Diagnostics.Stopwatch]::StartNew()
+            for ($j = 0; $j -lt $n; $j++) {
+                $splashPanel.Invalidate($refCache.Rect)
+                $splashPanel.Update()
+            }
+            $swPaint.Stop()
+            Write-Host ('splash repaint ' + $probe.S + ': ' + [Math]::Round($swPaint.Elapsed.TotalMilliseconds / $n, 1) + 'ms/帧  (重画区 ' + $script:MxClawCache.Rect.Width + 'x' + $script:MxClawCache.Rect.Height + ')')
         }
         $splashPanel.Visible = $false
 
@@ -3233,8 +3753,7 @@ function Show-Gui {
             # 看起来就是「一上来先顿一下」。
             $script:MxSplashTimer.Stop()
             [System.Windows.Forms.Application]::DoEvents()
-            $script:MxClawDraw = [double]0
-            $script:MxClawHold = [double]0
+            $script:MxClawT    = [double]0
             $script:MxClawFade = [double]0
             $script:MxClawWatch.Restart()
             $script:MxClawLast = [double]0
@@ -3244,13 +3763,21 @@ function Show-Gui {
             # 睡 4 毫秒实际会睡满一个粒度，再叠上每帧十几毫秒的绘制，
             # 动画就被压到三十帧上下。DoEvents 空转时队列为空会立刻返回，
             # 节奏完全交给 16 毫秒的动画定时器，正好是 60 帧；开销只有这一秒多的一个核。
-            while ($script:MxClawPhase -ne 'idle' -and $swIntro.ElapsedMilliseconds -lt 5000) {
+            # 上限取整条时间轴加一秒余量，正常情况由动画自己收场退出。
+            $introLimit = [int](([double]$script:MxClawTEnd + [double]$script:MxClawTFade + 1.0) * 1000)
+            while ($script:MxClawPhase -ne 'idle' -and $swIntro.ElapsedMilliseconds -lt $introLimit) {
                 [System.Windows.Forms.Application]::DoEvents()
             }
         }
         Write-Log ('=== ' + $script:AppName + ' v' + $script:Version + '  ·  Miuix 界面 ===')
         Write-Log ('管理员权限: ' + $script:IsAdmin + '   缩放: ' + [math]::Round($script:MxScale * 100) + '%')
         if (-not $script:IsAdmin) { Write-Log '提示：未以管理员身份运行，标注「需管理员权限」的项目将无法清理。' }
+        # 把自动隐藏的明细写清楚：用户看不到某一项时，得能在日志里找到原因。
+        if ($script:MxHiddenEntries.Count -gt 0) {
+            Write-Log ('已按本机情况自动隐藏 ' + $script:MxHiddenEntries.Count + ' 项：本机没有对应的软件或目录（清单 ' + $script:Entries.Count + ' + 隐藏 ' + $script:MxHiddenEntries.Count + ' = ' + ($script:Entries.Count + $script:MxHiddenEntries.Count) + ' 项）')
+            Write-Log ('    隐藏：' + (($script:MxHiddenEntries | ForEach-Object { $_.Name }) -join '、'))
+            Write-Log '    装了对应软件（或在标准位置产生数据）后重新打开程序，它们会自己回来。'
+        }
         $listView.Focus()
         # 动画已经放完，C# 也早就编译好了，这里基本不等待，只是取一下结果
         Wait-MxFastCompile
@@ -3396,6 +3923,66 @@ function Invoke-SelfTest {
     $ids = $cat | ForEach-Object { $_.Id }
     Check '清理项 ID 无重复' (($ids | Sort-Object -Unique).Count -eq $ids.Count) '存在重复 ID'
     Check '包含系统还原点检测项' ($ids -contains 'RestorePoint') '未找到 RestorePoint 条目'
+
+    # 通配符重叠是这一版新加清理项时踩到的坑：Windows 文件名不区分大小写，
+    # 同一项里若同时写了 QQ\Temp 与 QQ\temp（或 ActivityLog.xml 与 ActivityLog*.xml），
+    # 同一个路径会被匹配两次，体积重复计入、删除也会重复执行。
+    # 这项检查把「同一项内展开后出现重复路径」变成一条常驻不变量，以后加项不用靠人眼。
+    $dupEntry = ''
+    $noTarget = ''
+    foreach ($e in $cat) {
+        if ($null -eq $e.Targets -or $e.Targets.Count -eq 0) {
+            # 这几类不走路径，本来就没有 Targets
+            $byKind = @('RecycleBin', 'RestorePoint', 'EventLog', 'Dism', 'Hibernate')
+            if ($byKind -notcontains $e.Kind) { $noTarget = $e.Id }
+            continue
+        }
+        # 这里只校验「目标写得出来」，不校验「能解析到路径」：
+        # 对应软件没装时（例如没装 QQ）展开为空是正常结果，不该算失败。
+        foreach ($t in $e.Targets) {
+            if ([string]::IsNullOrWhiteSpace($t)) { $noTarget = ($e.Id + ' 存在空的目标'); break }
+        }
+        if ($noTarget) { break }
+        $seen = @{}
+        foreach ($p in (Expand-Targets $e.Targets)) {
+            $key = $p.ToLower()
+            if ($seen.ContainsKey($key)) { $dupEntry = ($e.Id + ' -> ' + $p); break }
+            $seen[$key] = 1
+        }
+        if ($dupEntry) { break }
+    }
+    Check '各项目标路径展开后无重复' ($dupEntry -eq '') ('通配符重叠：' + $dupEntry)
+    Check '路径型清理项都声明了目标路径' ($noTarget -eq '') ('目标缺失：' + $noTarget)
+
+    # 自动适用性判定：本机不适用（没有对应软件或目录）的项不会进列表。
+    # 这里校验判据本身没写反：四类「任何 Windows 上都有」的项永远不该被隐藏，
+    # 被隐藏的项也必须是目标确实全都不可达的那种。
+    $alwaysKinds = @('RecycleBin', 'EventLog', 'Dism', 'RestorePoint')
+    $hidList = @($cat | Where-Object { -not (Test-MxEntryApplicable -Entry $_) })
+    $badHide = @($hidList | Where-Object { $alwaysKinds -contains $_.Kind })
+    Check ('自动隐藏 ' + $hidList.Count + ' 项本机不适用，常驻项无误判') ($badHide.Count -eq 0) ('被误藏：' + (($badHide | ForEach-Object { $_.Id }) -join ','))
+    $misHide = @($hidList | Where-Object {
+        $alwaysKinds -notcontains $_.Kind -and $_.Kind -ne 'Hibernate' -and (@(Expand-Targets $_.Targets).Count -gt 0)
+    })
+    Check '被隐藏的项，其目标路径确实都不可达' ($misHide.Count -eq 0) ('误判：' + (($misHide | ForEach-Object { $_.Id }) -join ','))
+    $hib = @($cat | Where-Object { $_.Id -eq 'Hibernate' })
+    if ($hib.Count -gt 0) {
+        # 基准用「列盘根目录找名字」，不能用 Test-Path——后者对 hiberfil.sys
+        # 在普通权限下恒为 false，拿它当基准等于自己骗自己（这一版最初就是这么错过的）。
+        $hasHib = $false
+        try {
+            foreach ($f in [System.IO.Directory]::GetFiles($env:SystemDrive + '\')) {
+                if ([System.IO.Path]::GetFileName($f) -ieq 'hiberfil.sys') { $hasHib = $true; break }
+            }
+        } catch {
+            $hasHib = (Test-MxEntryApplicable -Entry $hib[0])   # 连盘根都列不出来时只能自证
+        }
+        Check ('休眠项判据与 hiberfil.sys 实际存在情况一致（实际存在=' + $hasHib + '）') ((Test-MxEntryApplicable -Entry $hib[0]) -eq $hasHib) '判据与实际不符'
+        if ($hasHib) {
+            $null = Measure-Entry -Entry $hib[0]
+            Check ('休眠文件体积读得到（' + (Format-Size $hib[0].Size) + '）') ($hib[0].Size -gt 0) '体积被算成 0，说明存在性判断又退化回了 Test-Path'
+        }
+    }
 
     Write-Host ''
     Write-Host '6) 系统还原点读取（有权限时应读到数据，无权限时应安全退化且不抛异常）'

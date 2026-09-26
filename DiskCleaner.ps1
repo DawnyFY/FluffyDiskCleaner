@@ -1709,7 +1709,6 @@ function Show-MxDialog {
     $maxBody = MxU 300
     if ($bodyH -gt $maxBody) { $bodyH = $maxBody }
 
-    $titleY = MxU 22
     $bodyY = MxU 54
     $gapY = MxU 20
     $btnH = MxU 40
@@ -2031,7 +2030,7 @@ function Show-Gui {
 
     # 图表几何只在这里算，绘制与命中检测都取它，避免两处圆心或半径不一致
     function Get-MxChartGeometry {
-        param([int]$PanelW, [int]$PanelH)
+        param([int]$PanelW)
         [PSCustomObject]@{
             Cx   = ($PanelW / 2.0)
             Cy   = (MxUF 158)
@@ -2055,7 +2054,7 @@ function Show-Gui {
         $cw  = $sender.Width
         $ch  = $sender.Height
         $px  = MxU 24
-        $geo = Get-MxChartGeometry -PanelW $cw -PanelH $ch
+        $geo = Get-MxChartGeometry -PanelW $cw
         $cx = $geo.Cx; $cy = $geo.Cy; $rOut = $geo.ROut; $rIn = $geo.RIn
 
         $brTitle = Get-MxBrush (Get-MxColor $script:Mx.OnBackground)
@@ -2191,7 +2190,7 @@ function Show-Gui {
     # 悬停判定：每次鼠标移动都重新探测强度，让该段跟着光标渐进伸缩
     $chartPanel.add_MouseMove({
         param($sender, $e)
-        $geo = Get-MxChartGeometry -PanelW $sender.Width -PanelH $sender.Height
+        $geo = Get-MxChartGeometry -PanelW $sender.Width
         $probe = Get-MxDonutProbe -X $e.X -Y $e.Y -Cx $geo.Cx -Cy $geo.Cy `
                                   -OuterR $geo.ROut -InnerR $geo.RIn `
                                   -Values $script:MxChart.Values -Slack (MxUF 14) -AngMargin 9
@@ -3326,27 +3325,6 @@ function Show-Gui {
         return $paths
     }
 
-    # 缓动与夹取。整套动画的所有参数都从同一条时间轴推出来并集中在下面一个函数里，
-    # 自检才能按任意时间点定格渲染，不会出现「只有播放路径画得出来」的情况。
-    function MxRamp {
-        param([double]$x)
-        if ($x -lt 0.0) { return [double]0 }
-        if ($x -gt 1.0) { return [double]1 }
-        return $x
-    }
-    function MxEaseOut {
-        param([double]$x, [double]$p = 2.0)
-        return (1.0 - [Math]::Pow(1.0 - $x, $p))
-    }
-    function MxEaseIn {
-        param([double]$x, [double]$p = 2.0)
-        return [Math]::Pow($x, $p)
-    }
-    function MxEaseInOut {
-        param([double]$x)
-        return ($x * $x * (3.0 - 2.0 * $x))
-    }
-
     # 由累计时间推出这一帧的全部参数 —— 都在 C# 渲染器里（ClawRenderer.State）。
     # 状态只依赖累计秒数，因而实时播放、关键帧定格渲染与逐帧导出走同一条计算路径。
     function Get-MxSplashState {
@@ -3654,7 +3632,7 @@ function Show-Gui {
             $script:MxClawT      = [double]$frame.T
             $script:MxClawFade   = [double]0
             $sc = Get-MxSplashState -T ([double]$frame.T)
-            Write-Host ('  t=' + $frame.T + 's  推进=' + [Math]::Round([double]$sc.Draw, 3) + '  缩放=' + [Math]::Round([double]$sc.Scale, 3) + '  压扁=' + [Math]::Round([double]$sc.Squash, 3) + '  玻璃体=' + [Math]::Round([double]$sc.Body, 3) + '  笔头=' + [Math]::Round([double]$sc.Head, 3) + '  柔光=' + [Math]::Round([double]$sc.Halo, 3) + '  镜面=' + [Math]::Round([double]$sc.Shine, 3) + '  落款=' + [Math]::Round([double]$sc.Text, 3))
+            Write-Host ('  t=' + $frame.T + 's  推进=' + [Math]::Round([double]$sc.Draw, 3) + '  缩放=' + [Math]::Round([double]$sc.Scale, 3) + '  玻璃体=' + [Math]::Round([double]$sc.Body, 3) + '  镜面=' + [Math]::Round([double]$sc.Shine, 3) + '  落款=' + [Math]::Round([double]$sc.Text, 3))
             $splashPanel.Region  = $null
             $splashPanel.Visible = $false
             $splashPanel.Invalidate()
@@ -3857,8 +3835,6 @@ function Show-Gui {
 function Invoke-SelfTest {
     Write-Host ''
     Write-Host '=== 自检模式（仅在临时目录内操作，不触碰真实数据）==='
-    $pass = 0
-    $fail = 0
 
     function Check {
         param([string]$Name, [bool]$Cond, [string]$Detail)

@@ -1709,7 +1709,6 @@ function Show-MxDialog {
     $maxBody = MxU 300
     if ($bodyH -gt $maxBody) { $bodyH = $maxBody }
 
-    $titleY = MxU 22
     $bodyY = MxU 54
     $gapY = MxU 20
     $btnH = MxU 40
@@ -2031,7 +2030,7 @@ function Show-Gui {
 
     # 图表几何只在这里算，绘制与命中检测都取它，避免两处圆心或半径不一致
     function Get-MxChartGeometry {
-        param([int]$PanelW, [int]$PanelH)
+        param([int]$PanelW)
         [PSCustomObject]@{
             Cx   = ($PanelW / 2.0)
             Cy   = (MxUF 158)
@@ -2055,7 +2054,7 @@ function Show-Gui {
         $cw  = $sender.Width
         $ch  = $sender.Height
         $px  = MxU 24
-        $geo = Get-MxChartGeometry -PanelW $cw -PanelH $ch
+        $geo = Get-MxChartGeometry -PanelW $cw
         $cx = $geo.Cx; $cy = $geo.Cy; $rOut = $geo.ROut; $rIn = $geo.RIn
 
         $brTitle = Get-MxBrush (Get-MxColor $script:Mx.OnBackground)
@@ -2191,7 +2190,7 @@ function Show-Gui {
     # 悬停判定：每次鼠标移动都重新探测强度，让该段跟着光标渐进伸缩
     $chartPanel.add_MouseMove({
         param($sender, $e)
-        $geo = Get-MxChartGeometry -PanelW $sender.Width -PanelH $sender.Height
+        $geo = Get-MxChartGeometry -PanelW $sender.Width
         $probe = Get-MxDonutProbe -X $e.X -Y $e.Y -Cx $geo.Cx -Cy $geo.Cy `
                                   -OuterR $geo.ROut -InnerR $geo.RIn `
                                   -Values $script:MxChart.Values -Slack (MxUF 14) -AngMargin 9
@@ -3151,8 +3150,6 @@ function Show-Gui {
 function Invoke-SelfTest {
     Write-Host ''
     Write-Host '=== 自检模式（仅在临时目录内操作，不触碰真实数据）==='
-    $pass = 0
-    $fail = 0
 
     function Check {
         param([string]$Name, [bool]$Cond, [string]$Detail)

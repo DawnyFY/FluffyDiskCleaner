@@ -22,15 +22,17 @@ param(
     [string]$RenderTo,  # 渲染自检：把界面渲染成 PNG 后退出，用于校验视觉样式
     [int]$BenchPaint = 0, # 性能测量：连续重绘 N 帧并报告耗时
     [string]$SnapTo,    # 走真实启动流程后把窗口存成 PNG，用于排查渲染问题
-    [string]$Config     # 指定配置文件路径
+    [string]$Config,    # 指定配置文件路径
+    [string]$UnlockKey, # 二改授权：跳过完整性校验的解锁密钥（也可放在程序同目录的 unlock.key 里，见 README）
+    [switch]$IntegritySeal # 维护用：重新计算并写回脚本自身的完整性指纹（改过脚本后必须执行一次，否则启动会被自己的篡改检测拦下）
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
-# 自检 / 控制台 / 渲染 / 性能模式下让错误显式暴露，避免静默失败掩盖问题
-if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo) { $ErrorActionPreference = 'Continue' }
+# 自检 / 控制台 / 渲染 / 性能 / 封装模式下让错误显式暴露，避免静默失败掩盖问题
+if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo -or $IntegritySeal) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.5.0'
+$script:Version  = '1.5.4'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -56,6 +58,510 @@ function Get-ScriptDir {
     if ($PSCommandPath) { return (Split-Path -Parent $PSCommandPath) }
     return (Get-Location).Path
 }
+
+# ======================= 完整性自检（篡改检测）=======================
+#
+# 启动时先核对脚本自身的内容指纹，对不上就弹窗说明并直接退出：
+# 不进入扫描、不创建主界面、更不会执行任何清理。
+#
+# 指纹 = 整文件的 SHA256，但先做两处归一化：
+#   1) 行尾统一成 \n、去掉 BOM。这样用记事本另存、或从 git 检出时行尾被转换，
+#      都不会被误判成篡改；只有真正的内容改动才会命中。
+#   2) 把下面 MxIntBlob 那一行的值本身替换成等长占位符再算，否则就成了自己哈希自己。
+#      期望指纹不以明文存放：存的是 AES-256-CBC 加密后的 base64 密文，运行时才解出来比对。
+#
+# 这个检查能挡住什么、挡不住什么（写清楚，免得被当成比实际更强的保证）：
+#   能挡：下载 / 传输 / 解压不完整，被编辑器改坏，被人手工改掉几行，
+#         被泛化的恶意脚本追加或替换内容（那类代码通常并不知道要同步更新指纹）。
+#   挡不住：有备而来的人。读完源码就知道指纹怎么算，重新算一份填进去即可
+#         （-IntegritySeal 就是这个动作的正式入口，仅供发版和自改后重新封装）。
+#         要真正抗篡改得靠代码签名证书，不在本项目范围内。
+#   也挡不住：文件被整个删掉。被删掉的脚本没法自己报错，那种情况只会表现为
+#         双击或计划任务找不到文件。
+#
+# 期望指纹做了加密存放（不是明文十六进制），口令拆两段各自 base64：
+#   · 收益是实打实的：改文件的人不会在源码里看到一个能直接照抄、改一个字符就完事的
+#     十六进制串；他得先看懂解密流程、自己算出新值、再重新加密。对「把改过的副本重新
+#     打包分发」这个现实威胁，代价抬高就意味着那种副本更容易直接弹窗不工作。
+#   · 但它不是密钥保护：口令、盐、解密代码全在这同一个文件里，解释器必须先解密才能执行，
+#     等于锁和钥匙放在一起。真正抗篡改只有代码签名证书能做到。
+#   · 刻意不做 PBKDF2 迭代拉伸：拉伸针对的是低熵口令，而这里口令是 24 位随机串，
+#     瓶颈从来不是口令强度而是「与密文同处一文件」，拉伸只会给每次启动白加两百毫秒。
+$script:MxIntP1   = 'emY4aThIbkpxTEZ1'
+$script:MxIntP2   = 'OTg0OUxUVGNBNDlM'
+$script:MxIntSalt = 'cQXnbhvNdxUv/LZ4zLlCGQ=='
+$script:MxIntBlob = '65y8cyh1ENnNf1F8zSzm+w1PhCiXiZWolpsM4JK3DtE7juAh88ykL31v1kfMiuUqxJLK835Q2+K2w4zttqdMQHW7A+o0kVGeV5PqSMdWaZdYuBL0tMx/piT2a/Lwqt+i'
+
+# 删除引擎的总闸：只有完整性校验通过才会置真，判断在 Test-SafePath 里。
+# 意义是「把校验拆掉反而让工具彻底不干活」——删掉检查换不来一个能随便删文件的副本。
+$script:MxIntegrityOk = $false
+
+# 二改授权的解锁密钥：这里存的是密钥的 SHA-256 校验值（单向），密钥本身不进仓库。
+# 为什么不「把密钥加密后存进来」：只要密钥以任何可还原的形式出现在这份公开脚本里，
+# 它就已经不是密钥了——解密所需的一切同样公开。存单向校验值则无法反推，
+# 而且想二改的人必须真的拿到密钥（README 里有联系方式）才能过这一关。
+$script:MxUnlockVerifier = '9C4FB11E330625ECE137E3B4750640FF218D8C399C1B272DDC8EA7E97D49368C'
+$script:MxUnlocked  = $false   # 是否以「二改授权」模式运行
+$script:MxUnlockNotice = ''    # 解锁提示语，留到日志系统就绪后再打印（界面模式下加载期还没有日志框）
+
+# 自身文件路径：被改名也能定位（$PSCommandPath 跟着实际文件名走）
+$script:MxSelfPath = ''
+if ($PSCommandPath) { $script:MxSelfPath = $PSCommandPath }
+elseif ($PSScriptRoot) { $script:MxSelfPath = (Join-Path $PSScriptRoot 'DiskCleaner.ps1') }
+
+function Get-MxFileFingerprint {
+    param([string]$Path, [string]$MaskValue)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    if (-not (Test-Path -LiteralPath $Path)) { return '' }
+    try { $t = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) } catch { return '' }
+    if ($t.Length -gt 0 -and $t[0] -eq [char]0xFEFF) { $t = $t.Substring(1) }
+    $t = $t.Replace("`r`n", "`n").Replace("`r", "`n")
+    # 把指纹那一行的值挖掉：全 0 与真实值都归一成全 0，于是「未封装」和「已封装」
+    # 两种状态下算出来的是同一个数——封装流程正是靠这一点自举的。
+    if ($MaskValue) { $t = $t.Replace($MaskValue, ('0' * $MaskValue.Length)) }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $h = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($t)) } finally { $sha.Dispose() }
+    return ([System.BitConverter]::ToString($h) -replace '-', '')
+}
+
+# 原样字节的 SHA256：只用于对外公布，方便别人用 Get-FileHash 独立复核（不参与判定）
+function Get-MxPlainHash {
+    param([string]$Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $h = $sha.ComputeHash([System.IO.File]::ReadAllBytes($Path)) } finally { $sha.Dispose() }
+        return ([System.BitConverter]::ToString($h) -replace '-', '')
+    } catch { return '' }
+}
+
+# 篡改提示框。刻意写成自包含：这段代码在脚本最开头就会用到，此时后面的字体、
+# 主题色表、按钮工厂、DPI 处理都还没定义，不能依赖它们；配色照抄主题里的几个值，
+# 保证观感与主界面一致。它早于 Initialize-MxDpiAwareness 创建窗口，所以自带一层缩放。
+function Show-MxTamperAlert {
+    param([string]$Detail)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $k = 1.0
+    try { $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $k = [Math]::Max(1.0, $g.DpiX / 96.0); $g.Dispose() } catch { $k = 1.0 }
+    $S = { param([int]$v) return [int][Math]::Round($v * $k) }
+
+    # 多行 TextBox 只认 \r\n，脚本里常见的纯 \n 会被忽略、正文挤成一行
+    $Detail = ($Detail -replace "`r", '') -replace "`n", "`r`n"
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = '完整性校验未通过'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.StartPosition = 'CenterScreen'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.TopMost = $true
+    $dlg.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#FFFFFFFF')
+    try { $dlg.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9) }
+    catch { $dlg.Font = [System.Drawing.SystemFonts]::MessageBoxFont }
+    $dlg.ClientSize = New-Object System.Drawing.Size((& $S 664), (& $S 432))
+
+    $head = New-Object System.Windows.Forms.Label
+    $head.Text = '完整性校验未通过'
+    $head.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#FFE94634')
+    $head.Font = New-Object System.Drawing.Font($dlg.Font.FontFamily, 15, [System.Drawing.FontStyle]::Bold)
+    $head.Location = New-Object System.Drawing.Point((& $S 26), (& $S 20))
+    $head.AutoSize = $true
+    $dlg.Controls.Add($head)
+
+    $sub = New-Object System.Windows.Forms.Label
+    $sub.Text = '脚本文件与发布版本不一致。为防止执行被改动过的清理逻辑，程序已停止运行。'
+    $sub.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#CC000000')
+    $sub.Location = New-Object System.Drawing.Point((& $S 28), (& $S 62))
+    $sub.AutoSize = $true
+    $dlg.Controls.Add($sub)
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Multiline = $true
+    $box.ReadOnly = $true
+    $box.ScrollBars = 'Vertical'
+    $box.BorderStyle = 'FixedSingle'
+    $box.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#FFF7F7F7')
+    $box.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#FF303030')
+    try { $box.Font = New-Object System.Drawing.Font('Consolas', 9) } catch { }
+    $box.Location = New-Object System.Drawing.Point((& $S 28), (& $S 94))
+    $box.Size = New-Object System.Drawing.Size((& $S 608), (& $S 252))
+    $box.Text = $Detail
+    $dlg.Controls.Add($box)
+
+    $btnCopy = New-Object System.Windows.Forms.Button
+    $btnCopy.Text = '复制详情'
+    $btnCopy.FlatStyle = 'Flat'
+    $btnCopy.FlatAppearance.BorderColor = [System.Drawing.ColorTranslator]::FromHtml('#FFD9D9D9')
+    $btnCopy.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#FFF0F0F0')
+    $btnCopy.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#FF303030')
+    $btnCopy.Size = New-Object System.Drawing.Size((& $S 110), (& $S 38))
+    $btnCopy.Location = New-Object System.Drawing.Point((& $S 412), (& $S 362))
+    $btnCopy.Add_Click({ try { [System.Windows.Forms.Clipboard]::SetText($box.Text) } catch { } })
+    $dlg.Controls.Add($btnCopy)
+
+    $btnOut = New-Object System.Windows.Forms.Button
+    $btnOut.Text = '退出'
+    $btnOut.FlatStyle = 'Flat'
+    $btnOut.FlatAppearance.BorderSize = 0
+    $btnOut.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#FF3482FF')
+    $btnOut.ForeColor = [System.Drawing.ColorTranslator]::FromHtml('#FFFFFFFF')
+    $btnOut.Size = New-Object System.Drawing.Size((& $S 110), (& $S 38))
+    $btnOut.Location = New-Object System.Drawing.Point((& $S 526), (& $S 362))
+    $btnOut.Add_Click({ $dlg.Close() })
+    $dlg.Controls.Add($btnOut)
+    $dlg.AcceptButton = $btnOut
+    $dlg.CancelButton = $btnOut
+
+    [void]$dlg.ShowDialog()
+    $dlg.Dispose()
+}
+
+# ---------- 期望指纹的加解密 ----------
+# 三段材料（口令两段 + 盐）经 SHA-256 派生出 32 字节密钥。为什么用 SHA-256 而不是
+# PBKDF2：见上面常量处的说明——口令是高熵随机串，且它与密文同处一个文件，
+# 迭代拉伸在这里换不到任何安全收益，只会拖慢每次启动。
+function Get-MxIntKey {
+    try {
+        $salt = [Convert]::FromBase64String($script:MxIntSalt)
+        $pass = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:MxIntP1)) +
+                [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script:MxIntP2))
+        $pb = [System.Text.Encoding]::UTF8.GetBytes($pass)
+        $buf = New-Object byte[] ($salt.Length + $pb.Length)
+        [Array]::Copy($salt, 0, $buf, 0, $salt.Length)
+        [Array]::Copy($pb, 0, $buf, $salt.Length, $pb.Length)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { return $sha.ComputeHash($buf) } finally { $sha.Dispose() }
+    } catch { return $null }
+}
+
+# 解密：返回 64 位十六进制指纹；任何一步失败都返回空串，由调用方判定为不一致（fail-closed）
+function Unprotect-MxIntValue {
+    param([string]$BlobB64)
+    try {
+        $key = Get-MxIntKey
+        if (-not $key) { return '' }
+        $blob = [Convert]::FromBase64String($BlobB64)
+        if ($blob.Length -le 16) { return '' }
+        $iv = New-Object byte[] 16
+        [Array]::Copy($blob, 0, $iv, 0, 16)
+        $ct = New-Object byte[] ($blob.Length - 16)
+        [Array]::Copy($blob, 16, $ct, 0, $ct.Length)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        try {
+            $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
+            $aes.Key = $key; $aes.IV = $iv
+            $dec = $aes.CreateDecryptor()
+            try { $pt = $dec.TransformFinalBlock($ct, 0, $ct.Length) } finally { $dec.Dispose() }
+        } finally { $aes.Dispose() }
+        $s = [System.Text.Encoding]::UTF8.GetString($pt)
+        if ($s -match '^[0-9A-Fa-f]{64}$') { return $s.ToUpper() }
+        return ''
+    } catch { return '' }
+}
+
+# 加密：每次都用新 IV，所以同一个指纹每次得到的密文都不同。
+# 注意密文长度恒定（明文恒为 64 字符 → 80 字节密文 → 16 字节 IV + 80 = 128 字符 base64），
+# 掩码方案依赖这一点：掩码后的文本必须与密文内容无关。
+function Protect-MxIntValue {
+    param([string]$Plain)
+    try {
+        $key = Get-MxIntKey
+        if (-not $key) { return '' }
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        try {
+            $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
+            $aes.Key = $key
+            $aes.GenerateIV()
+            $enc = $aes.CreateEncryptor()
+            try { $ct = $enc.TransformFinalBlock([System.Text.Encoding]::UTF8.GetBytes($Plain), 0, $Plain.Length) } finally { $enc.Dispose() }
+            $out = New-Object byte[] (16 + $ct.Length)
+            [Array]::Copy($aes.IV, 0, $out, 0, 16)
+            [Array]::Copy($ct, 0, $out, 16, $ct.Length)
+            return [Convert]::ToBase64String($out)
+        } finally { $aes.Dispose() }
+    } catch { return '' }
+}
+
+# 定长比较：不用 -eq，避免有人把比较运算符一改就绕过（-eq 改成 -ne、加个 -not 之类）。
+# 逐字节异或累加，不提前返回，也不会因为长度不同而短路成「看着像相等」。
+function Test-MxHashEqual {
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return $false }
+    if ($A.Length -ne $B.Length) { return $false }
+    $d = 0
+    for ($i = 0; $i -lt $A.Length; $i++) { $d = $d -bor ([int][char]$A[$i] -bxor [int][char]$B[$i]) }
+    return ($d -eq 0)
+}
+
+# ---------- 二改授权的解锁密钥 ----------
+# 只做单向比对：脚本里没有任何可还原出密钥的材料。
+# 这里不做 PBKDF2 迭代拉伸的理由同上面加密段——密钥是 40 字符、约 254 位熵的随机串，
+# 不是人自己选的弱口令，暴破不可行，拉伸只会拖慢启动。
+function Test-MxUnlockKey {
+    param([string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $h = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes('dcleaner-unlock-v1:' + $Key)) } finally { $sha.Dispose() }
+        $v = ([System.BitConverter]::ToString($h) -replace '-', '')
+    } catch { return $false }
+    # 复用定长比较，顺带避免「把比较运算符一改就绕过」这条老路
+    return (Test-MxHashEqual $v $script:MxUnlockVerifier)
+}
+
+# 密钥来源：命令行 -UnlockKey 优先，其次程序同目录的 unlock.key。
+# 推荐后者——命令行参数会出现在进程列表里，而那个文件在 .gitignore 中，不会被提交。
+function Get-MxPresentedUnlockKey {
+    param([string]$Given)
+    if (-not [string]::IsNullOrWhiteSpace($Given)) { return $Given.Trim() }
+    try {
+        $f = Join-Path (Get-ScriptDir) 'unlock.key'
+        if (-not (Test-Path -LiteralPath $f)) { return '' }
+        # 只读开头一小段。这个文件本应是一行普通文本，但它也可能是巨大文件，
+        # 或是硬链接/符号链接指向一个巨大文件——那样一次性读进内存会直接卡死启动，
+        # 而这段代码跑在界面出现之前，卡住就等于程序根本起不来。先看长度、再逐行读、限制行数。
+        $fi = New-Object System.IO.FileInfo($f)
+        if ($fi.Length -le 0 -or $fi.Length -gt 8192) { return '' }
+        $sr = New-Object System.IO.StreamReader($f, [System.Text.Encoding]::UTF8)
+        try {
+            $lines = 0
+            while (-not $sr.EndOfStream -and $lines -lt 64) {
+                $lines++
+                $s = $sr.ReadLine()
+                if ($null -eq $s) { break }
+                $s = $s.Trim()
+                if (-not $s -or $s.StartsWith('#')) { continue }
+                if ($s.Length -gt 256) { return '' }   # 密钥没有这么长，超长一律当无效
+                return $s
+            }
+        } finally { $sr.Dispose() }
+    } catch { }
+    return ''
+}
+
+# 把「怎么算、怎么判」集中在这里，启动检查和自检共用同一套判断：
+# 两边各写一份的话，很容易出现「自检通过但启动被拦」这种自相矛盾的状态。
+function Get-MxIntegrityState {
+    $path   = $script:MxSelfPath
+    $issues = New-Object System.Collections.ArrayList
+    $blob     = $script:MxIntBlob
+    $expected = Unprotect-MxIntValue $blob
+    $actual   = ''
+    $sidePath = ''
+    $sideValue = ''
+    $hasSide  = $false
+
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        # 定位不到自身（例如把脚本内容直接喂给 iex）：无从校验，按通过处理。
+        # 注意「文件被删掉」不落在这里——脚本已经在跑，说明路径是有的，
+        # 那种情况会在下面因读不到内容而判定不一致。
+    } elseif (-not (Test-Path -LiteralPath $path)) {
+        [void]$issues.Add('脚本文件不存在（可能已被删除或移动）')
+    } else {
+        # 掩码用密文本身（不是明文指纹）：密文恒定 128 字符，掩码后那一段被抹成等长占位符，
+        # 于是掩码结果与密文内容无关，封装才能自洽。
+        $actual = Get-MxFileFingerprint -Path $path -MaskValue $blob
+        if (-not $expected) {
+            [void]$issues.Add('指纹密文无法解密（密钥材料被改动过）')
+        } elseif (-not (Test-MxHashEqual $actual $expected)) {
+            [void]$issues.Add('脚本内容指纹与封装值不一致')
+        }
+
+        # 同目录若放了随发行包附带的 DiskCleaner.sha256，也一并核对。
+        # 它挡的是「两个不同版本的文件被混在一起」这类事故；没有这个文件不算问题。
+        # 比的是密文而不是明文：免得这个校验文件变成明文指纹的泄露口。
+        $sidePath = Join-Path (Split-Path -Parent $path) 'DiskCleaner.sha256'
+        $hasSide  = (Test-Path -LiteralPath $sidePath)
+        if ($hasSide) {
+            try {
+                foreach ($ln in [System.IO.File]::ReadAllLines($sidePath)) {
+                    $s = $ln.Trim()
+                    if (-not $s -or $s.StartsWith('#')) { continue }
+                    $sideValue = ($s -split '\s+')[0]
+                    break
+                }
+            } catch { $sideValue = '' }
+            if ($sideValue -and ($sideValue -cne $blob)) { [void]$issues.Add('随附的 DiskCleaner.sha256 与脚本里的密文不一致（两个文件可能来自不同版本）') }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Path = $path; Expected = $expected; Actual = $actual; Blob = $blob
+        SidePath = $sidePath; SideValue = $sideValue; HasSide = $hasSide
+        Issues = $issues
+    }
+}
+
+function Assert-MxIntegrity {
+    $st = Get-MxIntegrityState
+    if ($st.Issues.Count -eq 0) {
+        # 通过：打开删除引擎的总闸。这一步是「拆掉校验就干不了活」的关键，
+        # 详见 Test-SafePath 开头那道判断。
+        $script:MxIntegrityOk = $true
+        return $true
+    }
+
+    $path = $st.Path
+    $expected = $st.Expected
+    $actual = $st.Actual
+    $issues = $st.Issues
+    $sidePath = $st.SidePath
+    $sideValue = $st.SideValue
+    $hasSide = $st.HasSide
+
+    $size  = 0
+    $lines = 0
+    try { $size  = (New-Object System.IO.FileInfo($path)).Length } catch { }
+    try { $lines = ([System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) -split "`n").Count } catch { }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('脚本文件：' + $path)
+    [void]$sb.AppendLine(('文件大小：{0:N0} 字节    行数：{1}' -f $size, $lines))
+    if ($hasSide) {
+        $show = if ($sideValue.Length -ge 16) { $sideValue.Substring(0, 16) + '…' } else { $sideValue }
+        [void]$sb.AppendLine('校验文件：' + $sidePath + '  （值 ' + $show + '）')
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('期望指纹（以密文存放，这里只给前 8 位——完整值不该交给改文件的人）：')
+    [void]$sb.AppendLine('  ' + $(if ($expected.Length -ge 8) { $expected.Substring(0, 8) + '…' } else { '(密文无法解密)' }))
+    [void]$sb.AppendLine('实际指纹：')
+    [void]$sb.AppendLine('  ' + $actual)
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('检出的问题：')
+    foreach ($issue in $issues) { [void]$sb.AppendLine('  · ' + $issue) }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('常见原因：下载 / 传输 / 解压不完整，或用编辑器打开后保存过、被别的脚本改过。')
+    [void]$sb.AppendLine('处理办法：从官方仓库重新下载一份，覆盖当前文件。')
+    [void]$sb.AppendLine('如果这处改动本来就是你做的，那是预期行为，重新封装指纹即可：')
+    [void]$sb.AppendLine('  powershell -ExecutionPolicy Bypass -File "' + $path + '" -IntegritySeal')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('注意：脚本被整个删除时它自己无法报错，那种情况只会表现为双击或计划任务找不到文件。')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('如果你是获得作者授权的二改者，请改用解锁密钥启动（用法见 README 的「二改与完整性校验」一节）。')
+    $detail = $sb.ToString()
+
+    # 控制台 / 自动化模式下不弹窗：没人点按钮，弹窗只会把进程永久挂住
+    if ($Console -or $SelfTest -or $RenderTo -or $SnapTo -or $BenchPaint) {
+        Write-Host ''
+        Write-Host '*** 完整性校验未通过，已停止运行 ***'
+        Write-Host $detail
+    } else {
+        Show-MxTamperAlert -Detail $detail
+    }
+    exit 3
+}
+
+# 维护入口：改过脚本后用它重新封装。必须放在断言之前，否则封装动作会被自己拦下。
+if ($IntegritySeal) {
+    $sealPath = $script:MxSelfPath
+    if ([string]::IsNullOrWhiteSpace($sealPath) -or -not (Test-Path -LiteralPath $sealPath)) {
+        Write-Host '找不到脚本自身，无法封装。'
+    } else {
+        # 有没有 BOM 必须看字节：ReadAllText 会把 BOM 当编码前导码直接吃掉，
+        # 字符串里根本看不到 U+FEFF，照字符串判断就会把 BOM 写丢——
+        # 而 PowerShell 5.1 解析含中文的 .ps1 是按 GBK 来的，丢了 BOM 会整个文件语法报错。
+        $rawBytes = [System.IO.File]::ReadAllBytes($sealPath)
+        $hasBom   = ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF)
+        $body     = [System.Text.Encoding]::UTF8.GetString($rawBytes)
+        if ($body.Length -gt 0 -and $body[0] -eq [char]0xFEFF) { $body = $body.Substring(1) }
+        $m = [regex]::Match($body, "MxIntBlob = '([A-Za-z0-9+/=]{40,})'")
+        if (-not $m.Success) {
+            Write-Host '没找到指纹密文行，无法封装。'
+        } else {
+            $curBlob = $m.Groups[1].Value
+            # 掩码要用「当前行里的那段密文」，不能固定用某个常量：
+            # 拿不对的东西去替换就匹配不到任何内容，算出来的哈希会把那段密文一起算进去，
+            # 写完必然自相矛盾。用当前密文做掩码，则不论它是什么，被掩码后的文本都一样。
+            $sealed = Get-MxFileFingerprint -Path $sealPath -MaskValue $curBlob
+            if ([string]::IsNullOrWhiteSpace($sealed)) {
+                Write-Host '计算指纹失败。'
+            } else {
+                # 幂等：现有密文解出来就是同一个指纹，就别动它。
+                # 否则每封装一次都会因换了新 IV 而生成不同密文，平白改写文件。
+                $newBlob = $curBlob
+                if ((Unprotect-MxIntValue $curBlob) -ne $sealed) {
+                    $newBlob = Protect-MxIntValue $sealed
+                    if ([string]::IsNullOrWhiteSpace($newBlob)) {
+                        Write-Host '加密失败：密钥材料有问题，无法封装。'
+                        Write-Host '已放弃封装，文件未改动。'
+                        exit 1
+                    }
+                    if ($newBlob.Length -ne $curBlob.Length) {
+                        # 掩码方案要求密文长度恒定（掩码后那一段必须变成长度固定的占位符）。
+                        # 长度一变，写进去的封装必然自相矛盾，宁可一个字都不写。
+                        Write-Host ('加密失败：密文长度从 ' + $curBlob.Length + ' 变成 ' + $newBlob.Length + '，掩码方案要求长度恒定。')
+                        Write-Host '已放弃封装，文件未改动。'
+                        exit 1
+                    }
+                }
+                $newBody = $body.Substring(0, $m.Groups[1].Index) + $newBlob + $body.Substring($m.Groups[1].Index + $m.Groups[1].Length)
+                if ($newBody -eq $body) {
+                    Write-Host '指纹已是最新，无需改动。'
+                } else {
+                    try {
+                        [System.IO.File]::WriteAllText($sealPath, $newBody, (New-Object System.Text.UTF8Encoding $hasBom))
+                    } catch {
+                        Write-Host ('写入失败：' + $_.Exception.Message)
+                    }
+                }
+                # 复核一律以磁盘上的实际内容为准：写没写成、写进去的是不是这个值，
+                # 都不能靠自己「以为」，要从文件里读回来。否则写失败时照样会报「已写入」。
+                $diskBlob = ''
+                try {
+                    $dm = [regex]::Match([System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($sealPath)), "MxIntBlob = '([A-Za-z0-9+/=]{40,})'")
+                    if ($dm.Success) { $diskBlob = $dm.Groups[1].Value }
+                } catch { }
+                if ($diskBlob -cne $newBlob) {
+                    Write-Host ('复核失败：磁盘上的密文与预期不符（读到 ' + $(if ($diskBlob) { [string]$diskBlob.Length + ' 字符' } else { '读不到' }) + '，预期 ' + $newBlob.Length + ' 字符）。')
+                } elseif ((Unprotect-MxIntValue $diskBlob) -ne $sealed) {
+                    Write-Host '复核失败：磁盘上的密文解出来不是刚算出的指纹。'
+                } elseif ($newBody -ne $body) {
+                    Write-Host ('指纹已写入（以密文形式，' + $newBlob.Length + ' 字符）：' + $sealed)
+                }
+                $verify = Get-MxFileFingerprint -Path $sealPath -MaskValue $diskBlob
+                if ($verify -eq $sealed) { Write-Host '复核通过：按磁盘内容重新计算的指纹与加密值一致。' }
+                else { Write-Host ('复核失败：按磁盘内容重新计算的指纹是 ' + $verify + '，与加密值不一致') }
+                # 再确认 BOM 与行尾没被写坏：这两样任一损坏，PowerShell 5.1 都会解析失败
+                $afterBytes = [System.IO.File]::ReadAllBytes($sealPath)
+                $afterBom   = ($afterBytes.Length -ge 3 -and $afterBytes[0] -eq 0xEF -and $afterBytes[1] -eq 0xBB -and $afterBytes[2] -eq 0xBF)
+                $afterText  = [System.Text.Encoding]::UTF8.GetString($afterBytes)
+                $afterBare  = ([regex]::Matches($afterText, "(?<!`r)`n")).Count
+                Write-Host ('文件形态：BOM ' + $(if ($afterBom) { '保留' } else { '丢失' }) + '（封装前 ' + $(if ($hasBom) { '有' } else { '无' }) + '），裸 LF ' + $afterBare + ' 处')
+                # 同目录有 DiskCleaner.sha256 就一并更新（发行包里带的那个）
+                $side = Join-Path (Split-Path -Parent $sealPath) 'DiskCleaner.sha256'
+                if (Test-Path -LiteralPath $side) {
+                    $txt = '# DiskCleaner 脚本指纹密文（与同目录 DiskCleaner.ps1 里的 MxIntBlob 一致）' + [Environment]::NewLine + $diskBlob + [Environment]::NewLine
+                    [System.IO.File]::WriteAllText($side, $txt, (New-Object System.Text.UTF8Encoding $false))
+                    Write-Host ('已同步更新：' + $side)
+                }
+                Write-Host ''
+                Write-Host '对外公布用的原样 SHA256（别人可用 Get-FileHash -Algorithm SHA256 独立复核）：'
+                Write-Host ('  ' + (Get-MxPlainHash -Path $sealPath))
+            }
+        }
+    }
+    exit 0
+}
+
+# 二改授权：先看有没有带上有效的解锁密钥。有就跳过校验，但把总闸打开让功能完整可用，
+# 并且必须显著提示——解锁不是隐身模式，日志里会明确写出「本次未校验」。
+if (-not $SelfTest -and -not $IntegritySeal) {
+    $ukPresented = Get-MxPresentedUnlockKey -Given $UnlockKey
+    if ($ukPresented -and (Test-MxUnlockKey $ukPresented)) {
+        $script:MxUnlocked = $true
+        $script:MxIntegrityOk = $true
+        $script:MxUnlockNotice = '注意：本次以「二改授权」模式运行，已跳过脚本完整性校验，当前文件内容未经核对。'
+    } elseif ($ukPresented) {
+        $script:MxUnlockNotice = '提示：提供的解锁密钥无效，已按正常流程校验文件完整性。'
+    }
+    if ($script:MxUnlockNotice -and $Console) { Write-Host $script:MxUnlockNotice }
+}
+
+# 立刻校验：扫描、界面、清理都不该在文件已被改动的前提下继续。
+# 自检模式除外——否则「改了脚本但还没封装」时连自检都跑不起来，
+# 而自检恰恰是封装前最该跑的一步（它会明确报出指纹不一致）。解锁模式已在上面放行。
+if (-not $SelfTest -and -not $script:MxUnlocked) { [void](Assert-MxIntegrity) }
 
 function Get-ConfigPath {
     param([string]$Override)
@@ -116,41 +622,124 @@ function Save-Config {
 
 # ======================= 安全校验 =======================
 
+# 取系统权威目录。**不直接用 $env: 里那几个用户级变量**：LOCALAPPDATA / APPDATA /
+# USERPROFILE / TEMP 都定义在 HKCU\Environment 下，普通用户（或一段只跑在用户权限下的
+# 脚本）可以改写它们，而本工具通常是提权运行的——一旦被改写，清理目标就会跟着被指向
+# 别处，等于把「删某个缓存目录」变成「以管理员身份删任意目录」。
+# 下面这几个接口走 SHGetKnownFolderPath，不受环境变量影响；取不到时才退回环境变量。
+function Get-MxKnownDir {
+    param([string]$Name, [string]$Fallback)
+    try {
+        $p = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]$Name)
+        if (-not [string]::IsNullOrWhiteSpace($p)) { return $p.TrimEnd('\') }
+    } catch { }
+    if ($Fallback) { return ([System.Environment]::ExpandEnvironmentVariables($Fallback)).TrimEnd('\') }
+    return ''
+}
+
+$script:MxWinDir   = Get-MxKnownDir 'Windows'               $env:SystemRoot
+$script:MxUpDir    = Get-MxKnownDir 'UserProfile'           $env:USERPROFILE
+$script:MxLaDir    = Get-MxKnownDir 'LocalApplicationData'  $env:LOCALAPPDATA
+$script:MxAdDir    = Get-MxKnownDir 'ApplicationData'       $env:APPDATA
+$script:MxPdDir    = Get-MxKnownDir 'CommonApplicationData' $env:ProgramData
+$script:MxPfDir    = Get-MxKnownDir 'ProgramFiles'          $env:ProgramFiles
+$script:MxPf86Dir  = Get-MxKnownDir 'ProgramFilesX86'       ${env:ProgramFiles(x86)}
+# 系统盘从 Windows 目录反推（'C:\' 与 'C:' 两种写法都要用），不用 $env:SystemDrive
+$script:MxSysRoot  = [System.IO.Path]::GetPathRoot($script:MxWinDir)
+if ([string]::IsNullOrWhiteSpace($script:MxSysRoot)) { $script:MxSysRoot = ($env:SystemDrive + '\') }
+$script:MxSysDrive = $script:MxSysRoot.TrimEnd('\')
+
 $script:ProtectedExact = @(
-    ($env:SystemDrive + '\'),
-    $env:SystemRoot,
-    (Join-Path $env:SystemRoot 'System32'),
-    (Join-Path $env:SystemRoot 'SysWOW64'),
-    (Join-Path $env:SystemRoot 'WinSxS'),
-    $env:ProgramFiles,
-    ${env:ProgramFiles(x86)},
-    $env:ProgramData,
-    $env:USERPROFILE,
-    $env:LOCALAPPDATA,
-    $env:APPDATA,
-    (Join-Path $env:USERPROFILE 'Desktop'),
-    (Join-Path $env:USERPROFILE 'Documents'),
-    (Join-Path $env:USERPROFILE 'Downloads'),
-    (Join-Path $env:USERPROFILE 'Pictures'),
-    (Join-Path $env:USERPROFILE 'Videos'),
-    (Join-Path $env:USERPROFILE 'Music'),
-    (Join-Path $env:USERPROFILE 'OneDrive'),
-    'C:\Users',
-    'C:\Windows'
+    $script:MxSysRoot,
+    $script:MxWinDir,
+    (Join-Path $script:MxWinDir 'System32'),
+    (Join-Path $script:MxWinDir 'SysWOW64'),
+    (Join-Path $script:MxWinDir 'WinSxS'),
+    $script:MxPfDir,
+    $script:MxPf86Dir,
+    $script:MxPdDir,
+    $script:MxUpDir,
+    $script:MxLaDir,
+    $script:MxAdDir,
+    (Join-Path $script:MxUpDir 'Desktop'),
+    (Join-Path $script:MxUpDir 'Documents'),
+    (Join-Path $script:MxUpDir 'Downloads'),
+    (Join-Path $script:MxUpDir 'Pictures'),
+    (Join-Path $script:MxUpDir 'Videos'),
+    (Join-Path $script:MxUpDir 'Music'),
+    (Join-Path $script:MxUpDir 'OneDrive'),
+    # 这两个额外写死，兼作「环境变量被改坏」时的兜底
+    ($script:MxSysDrive + '\Users'),
+    ($script:MxSysDrive + '\Windows')
+)
+
+# 「绝不能碰」的目录树：这些目录本身**及其内部任何路径**都不允许作为删除目标。
+# 与上面的精确名单不同，这里按前缀匹配。
+# 为什么需要它：精确名单只挡住「就是它本身」，而把 TEMP / LOCALAPPDATA 这类变量指到
+# 它们的内部去，就能绕过——所以整棵树都要挡住。
+# 名单里只放「现有一个合法清理项都不在里面」的目录。例如 C:\Windows\System32\LogFiles
+# 是合法的清理目标，所以不能把整个 System32 列进来，只列 config / drivers / winevt。
+$script:ProtectedTrees = @(
+    (Join-Path $script:MxWinDir 'System32\config'),
+    (Join-Path $script:MxWinDir 'System32\drivers'),
+    (Join-Path $script:MxWinDir 'System32\winevt'),
+    (Join-Path $script:MxWinDir 'Fonts'),
+    (Join-Path $script:MxWinDir 'assembly'),
+    (Join-Path $script:MxWinDir 'Microsoft.NET'),
+    $script:MxPfDir,
+    $script:MxPf86Dir,
+    (Join-Path $script:MxUpDir 'Desktop'),
+    (Join-Path $script:MxUpDir 'Documents'),
+    (Join-Path $script:MxUpDir 'Downloads'),
+    (Join-Path $script:MxUpDir 'Pictures'),
+    (Join-Path $script:MxUpDir 'Videos'),
+    (Join-Path $script:MxUpDir 'Music'),
+    (Join-Path $script:MxUpDir 'OneDrive'),
+    # 证书 / 密钥 / 凭据库：任何清理项都不该碰
+    (Join-Path $script:MxAdDir 'Microsoft\Crypto'),
+    (Join-Path $script:MxAdDir 'Microsoft\Protect'),
+    (Join-Path $script:MxAdDir 'Microsoft\SystemCertificates'),
+    (Join-Path $script:MxAdDir 'Microsoft\Vault')
 )
 
 function Test-SafePath {
     param([string]$Path)
+    # 总闸：完整性校验没通过，或者校验代码被整个摘掉导致闸门从没被打开，一律拒绝一切目标。
+    # 这样「把校验删掉」换不来一个能随便删文件的副本，只会换来一个什么都不删的副本——
+    # 失败方向是安全的，而不是敞开的。
+    if (-not $script:MxIntegrityOk) { return $false }
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    # 只接受本机固定盘上的普通路径：
+    #   · \\server\share 这类 UNC、以及 \\?\C:\ / \\.\PhysicalDrive0 这类设备路径一律拒绝
+    #     ——它们要么绕开「卷根目录」的判断，要么指向的根本不是目录；
+    #   · 8.3 短名（如 C:\PROGRA~1）文件系统认识、字符串比对却对不上黑名单，同样拒绝。
+    if ($Path -match '^\s*\\\\') { return $false }
+    if ($Path -match '~[0-9]') { return $false }
+
     try { $full = [System.IO.Path]::GetFullPath($Path) } catch { return $false }
 
-    # 不能是磁盘根目录
-    if ($full -match '^[A-Za-z]:\\?$') { return $false }
+    # Win32 会忽略路径末尾的点和空格（C:\Windows. 实际就是 C:\Windows），
+    # 逐段去掉再比对，否则加一个点就能绕过下面两份名单。
+    $parts = $full.Split('\')
+    for ($i = 0; $i -lt $parts.Length; $i++) { $parts[$i] = $parts[$i].TrimEnd([char[]]'. ') }
+    $normalized = ($parts -join '\')
+    if ([string]::IsNullOrWhiteSpace($normalized)) { return $false }
 
-    $trim = $full.TrimEnd('\')
+    # 不能是磁盘根目录
+    if ($normalized -match '^[A-Za-z]:\\?$') { return $false }
+
+    $trim = $normalized.TrimEnd('\')
     foreach ($p in $script:ProtectedExact) {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
         if ($trim -ieq $p.TrimEnd('\')) { return $false }
+    }
+
+    # 不能落在「绝不能碰」的目录树里面（含该目录本身）
+    $probe = $trim + '\'
+    foreach ($t in $script:ProtectedTrees) {
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        if ($probe.StartsWith($t.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
     }
 
     # 不能是本程序所在目录
@@ -424,14 +1013,48 @@ function Expand-Targets {
 
 function Clear-ReadOnlyRecursive {
     param([string]$Path)
-    Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    # 手工逐层遍历，并且**不跟进重解析点**（联结点 / 符号链接）。
+    # 原先用 Get-ChildItem -Recurse：PowerShell 5.1 会顺着联结点一路走进去，
+    # 于是一个本来只该改「本目录下文件属性」的动作，会扩散到链接指向的目标目录树里，
+    # 把目标目录之外的文件的只读 / 隐藏 / 系统属性也一并清掉。
+    $mask = ([System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::System -bor [System.IO.FileAttributes]::Hidden)
+    $link = [System.IO.FileAttributes]::ReparsePoint
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    $seen = 0
+    while ($stack.Count -gt 0) {
+        $cur = $stack.Pop()
+        $seen++
+        if ($seen -gt 50000) { break }   # 兜底：异常结构不至于把界面卡死
+        # 自己就是重解析点时必须立刻停在这里：只改链子本身的属性，
+        # 绝不枚举它的内容——否则「清只读」照样会顺着它扩散到目标目录树里去。
+        # （删除失败后进重试列表的路径里就可能是联结点，所以这个分支是可达的。）
+        $isLink = $false
+        try { $isLink = ((([System.IO.File]::GetAttributes($cur)) -band $link) -ne 0) } catch { $isLink = $true }
         try {
-            if ($_.Attributes -band ([System.IO.FileAttributes]::ReadOnly -bor [System.IO.FileAttributes]::System -bor [System.IO.FileAttributes]::Hidden)) {
-                $_.Attributes = [System.IO.FileAttributes]::Normal
+            if ((([System.IO.File]::GetAttributes($cur)) -band $mask) -ne 0) {
+                [System.IO.File]::SetAttributes($cur, [System.IO.FileAttributes]::Normal)
+            }
+        } catch { }
+        if ($isLink) { continue }
+        try {
+            foreach ($f in [System.IO.Directory]::GetFiles($cur)) {
+                try {
+                    if ((([System.IO.File]::GetAttributes($f)) -band $mask) -ne 0) {
+                        [System.IO.File]::SetAttributes($f, [System.IO.FileAttributes]::Normal)
+                    }
+                } catch { }
+            }
+        } catch { }
+        try {
+            foreach ($sd in [System.IO.Directory]::GetDirectories($cur)) {
+                try {
+                    if ((([System.IO.File]::GetAttributes($sd)) -band $link) -ne 0) { continue }
+                    $stack.Push($sd)
+                } catch { }
             }
         } catch { }
     }
-    try { (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Attributes = [System.IO.FileAttributes]::Normal } catch { }
 }
 
 function Remove-PathPermanent {
@@ -450,7 +1073,13 @@ function Remove-PathPermanent {
         Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
             $child = $_
             try {
-                if ($child.PSIsContainer) { [System.IO.Directory]::Delete($child.FullName, $true) }
+                if ($child.PSIsContainer) {
+                    # 联结点 / 符号链接只摘掉链子本身，不递归进去：
+                    # Directory.Delete(x, $true) 对重解析点会跟进目标目录树，
+                    # 等于把别处的文件删了，而这些文件并不在这个清理目标里。
+                    $isLink = ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+                    [System.IO.Directory]::Delete($child.FullName, (-not $isLink))
+                }
                 else { [System.IO.File]::Delete($child.FullName) }
             } catch { [void]$failed.Add($child.FullName) }
         }
@@ -520,12 +1149,16 @@ function New-Entry {
 }
 
 function Get-Catalog {
-    $la  = $env:LOCALAPPDATA
-    $ad  = $env:APPDATA
-    $win = $env:SystemRoot
-    $pd  = $env:ProgramData
-    $up  = $env:USERPROFILE
-    $sd  = $env:SystemDrive
+    # 一律用上面的权威目录，不用 $env: ——原因见 Get-MxKnownDir 上的说明。
+    # 唯一例外是 %TEMP%：把 TEMP 重定向到别的盘（例如内存盘）是常见做法，
+    # 所以仍然尊重环境变量，但它的落点会被 Test-SafePath 逐项校验，
+    # 指到系统关键目录里去的会被拒绝并写进日志。
+    $la  = $script:MxLaDir
+    $ad  = $script:MxAdDir
+    $win = $script:MxWinDir
+    $pd  = $script:MxPdDir
+    $up  = $script:MxUpDir
+    $sd  = $script:MxSysDrive
 
     $list = New-Object System.Collections.ArrayList
 
@@ -758,7 +1391,7 @@ function Test-MxEntryApplicable {
         'EventLog'     { return $true }
         'Dism'         { return $true }
         'RestorePoint' { return $true }
-        'Hibernate'    { return (-not (Test-MxPathAbsent -Path (Join-Path $env:SystemDrive 'hiberfil.sys'))) }
+        'Hibernate'    { return (-not (Test-MxPathAbsent -Path (Join-Path $script:MxSysRoot 'hiberfil.sys'))) }
     }
     if ($null -eq $Entry.Targets -or $Entry.Targets.Count -eq 0) { return $true }
     # 快路径：能解析到路径就是适用（Expand-Targets 负责通配符）
@@ -835,7 +1468,7 @@ function Get-MxRestoreInfo {
     # 这样即使后面读占用被拒，提示也能从干巴巴的「读不到」变成「读不到，但上限是多少」。
     $vol = $null
     try {
-        $vol = Get-CimInstance -ClassName Win32_Volume -Filter ("DriveLetter='" + $env:SystemDrive + "'") -ErrorAction Stop |
+        $vol = Get-CimInstance -ClassName Win32_Volume -Filter ("DriveLetter='" + $script:MxSysDrive + "'") -ErrorAction Stop |
                Select-Object -First 1
         if ($vol) { $info.Capacity = [double]$vol.Capacity }
     } catch { }
@@ -890,13 +1523,13 @@ function Measure-Entry {
     param($Entry)
     switch ($Entry.Kind) {
         'RecycleBin' {
-            $Entry.Size = Get-PathSize (Join-Path $env:SystemDrive '$Recycle.Bin')
+            $Entry.Size = Get-PathSize (Join-Path $script:MxSysRoot '$Recycle.Bin')
         }
         'Hibernate' {
-            $Entry.Size = Get-PathSize (Join-Path $env:SystemDrive 'hiberfil.sys')
+            $Entry.Size = Get-PathSize (Join-Path $script:MxSysRoot 'hiberfil.sys')
         }
         'Dism' {
-            $Entry.Size = Get-PathSize (Join-Path $env:SystemRoot 'WinSxS')
+            $Entry.Size = Get-PathSize (Join-Path $script:MxWinDir 'WinSxS')
         }
         'RestorePoint' {
             # 行内描述必须短：这一列只有 639 像素（列表 920 减去左右留白、开关与尺寸列），
@@ -971,11 +1604,13 @@ function Invoke-Entry {
     switch ($Entry.Kind) {
 
         'RecycleBin' {
-            $bin = Join-Path $env:SystemDrive '$Recycle.Bin'
+            $bin = Join-Path $script:MxSysRoot '$Recycle.Bin'
             $before = Get-PathSize $bin
-            try { Clear-RecycleBin -DriveLetter ($env:SystemDrive.TrimEnd(':')) -Force -ErrorAction Stop }
+            try { Clear-RecycleBin -DriveLetter ($script:MxSysDrive.TrimEnd(':')) -Force -ErrorAction Stop }
             catch {
                 Get-ChildItem -LiteralPath $bin -Force -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    # 逐个 SID 目录也要过一遍安全校验，别因为父目录干净就跳过
+                    if (-not (Test-SafePath $_.FullName)) { Write-Log ('    跳过 ' + $_.FullName + ' : 安全校验未通过'); return }
                     try { [System.IO.Directory]::Delete($_.FullName, $true) } catch { }
                 }
             }
@@ -985,7 +1620,7 @@ function Invoke-Entry {
         }
 
         'Hibernate' {
-            $f = Join-Path $env:SystemDrive 'hiberfil.sys'
+            $f = Join-Path $script:MxSysRoot 'hiberfil.sys'
             $before = Get-PathSize $f
             try { Start-Process -FilePath 'powercfg.exe' -ArgumentList '/h', 'off' -Wait -NoNewWindow -ErrorAction Stop } catch { }
             Start-Sleep -Seconds 2
@@ -995,7 +1630,7 @@ function Invoke-Entry {
 
         'Dism' {
             try {
-                $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\Dism.exe') `
+                $p = Start-Process -FilePath (Join-Path $script:MxWinDir 'System32\Dism.exe') `
                                    -ArgumentList '/Online', '/Cleanup-Image', '/StartComponentCleanup' `
                                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
                 Write-Log ('    DISM 退出码: ' + $p.ExitCode)
@@ -1008,8 +1643,8 @@ function Invoke-Entry {
             # /for 指定系统卷、/all 删除该卷全部卷影副本、/quiet 跳过交互确认。
             $before = (Get-MxRestoreInfo).Size
             try {
-                $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\vssadmin.exe') `
-                                   -ArgumentList @('delete', 'shadows', ('/for=' + $env:SystemDrive), '/all', '/quiet') `
+                $p = Start-Process -FilePath (Join-Path $script:MxWinDir 'System32\vssadmin.exe') `
+                                   -ArgumentList @('delete', 'shadows', ('/for=' + $script:MxSysDrive), '/all', '/quiet') `
                                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
                 Write-Log ('    vssadmin 退出码: ' + $p.ExitCode)
                 if ($p.ExitCode -ne 0) {
@@ -1047,6 +1682,21 @@ function Invoke-Entry {
 function Start-Clean {
     param([scriptblock]$Report, [scriptblock]$Progress)
 
+    # 真正动手之前再校验一次文件完整性。两个理由：
+    #   1) 启动到现在文件可能已经被换掉（TOCTOU），那时启动那一次校验是旧结论；
+    #   2) 多一个调用点，光把启动处那一个删掉也没用——这里还会拦一次。
+    # 解锁模式下跳过：那种情况本身就是「经授权后自行改动」的场景。
+    if (-not $script:MxUnlocked) { [void](Assert-MxIntegrity) }
+
+    # 总闸的第二道判断，而且是更关键的一道：Test-SafePath 只能挡住「按路径删除」的项目，
+    # 而清空回收站（Clear-RecycleBin）、清空事件日志（wevtutil）、关闭休眠（powercfg）、
+    # 删除卷影副本（vssadmin）、DISM 组件清理走的都是系统 API 或独立程序，
+    # 根本不经过 Test-SafePath。少了这一道，把校验代码删掉之后这五项照样会执行。
+    if (-not $script:MxIntegrityOk) {
+        Write-Log '完整性校验未通过：已拒绝执行任何清理。'
+        return [double]0
+    }
+
     $script:Cleaning = $true
     $totalFreed = [double]0
     $targets = @($script:Entries | Where-Object { $_.Selected })
@@ -1079,7 +1729,7 @@ function Write-Log {
 }
 
 function Get-DiskInfo {
-    $d = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='" + $env:SystemDrive + "'")
+    $d = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='" + $script:MxSysDrive + "'")
     if (-not $d) { return $null }
     return [PSCustomObject]@{
         Total = [double]$d.Size
@@ -1114,7 +1764,7 @@ function Invoke-ConsoleMode {
     Write-Host ("=== {0} v{1} (控制台模式) ===" -f $script:AppName, $script:Version)
     Write-Host ("管理员权限: {0}" -f $script:IsAdmin)
     $d0 = Get-DiskInfo
-    if ($d0) { Write-Host ("磁盘 {0}  总 {1}  可用 {2}" -f $env:SystemDrive, (Format-Size $d0.Total), (Format-Size $d0.Free)) }
+    if ($d0) { Write-Host ("磁盘 {0}  总 {1}  可用 {2}" -f $script:MxSysDrive, (Format-Size $d0.Total), (Format-Size $d0.Free)) }
     Write-Host ''
 
     Write-Host '正在扫描...'
@@ -1130,7 +1780,24 @@ function Invoke-ConsoleMode {
 
     Write-Host ''
     Write-Host ("将清理 {0} 个项目（永久删除，不进回收站）" -f $picked.Count)
-    if (-not $AutoRun) {
+
+    if ($AutoRun) {
+        # -Auto 是给计划任务用的「不问就清」，但「不问」的前提得是「用户已经明确选过」。
+        # 配置文件不存在时，勾选只是内置默认值（其中包含回收站这类默认勾选项），
+        # 直接执行等于让一份没有人看过的清单去做永久删除——实测最容易踩的场景是
+        # 刚把整个文件夹拷到一台新机器上、又挂了 -Auto 的计划任务。
+        # 图形界面那条路本来就有同样的兜底（$script:AutoClean -and $script:ConfigExisted），
+        # 这里对齐：没有配置文件就只扫描、不清理。
+        if (-not $script:ConfigExisted) {
+            Write-Host ''
+            Write-Host '未找到配置文件，已跳过自动清理。'
+            Write-Host ('  配置文件位置：' + $script:ConfigPath)
+            Write-Host '  -Auto 的含义是「按配置清理、不再询问」，而本机还没有任何配置，'
+            Write-Host '  此刻的勾选只是内置默认值，直接执行会变成「无人确认过就永久删除」。'
+            Write-Host '  请先不带 -Auto 运行一次（或打开图形界面）确认勾选并生成配置，之后 -Auto 即可正常工作。'
+            return
+        }
+    } else {
         $ans = Read-Host '确认执行？输入 Y 继续'
         if ($ans -ne 'Y' -and $ans -ne 'y') { Write-Host '已取消。'; return }
     }
@@ -1139,7 +1806,7 @@ function Invoke-ConsoleMode {
     $d1 = Get-DiskInfo
     Write-Host ''
     Write-Host ("清理完成，共释放 {0}" -f (Format-Size $freed))
-    if ($d1) { Write-Host ("磁盘 {0}  可用 {1}" -f $env:SystemDrive, (Format-Size $d1.Free)) }
+    if ($d1) { Write-Host ("磁盘 {0}  可用 {1}" -f $script:MxSysDrive, (Format-Size $d1.Free)) }
 }
 
 # ======================= 图形界面（Miuix 风格） =======================
@@ -1832,7 +2499,11 @@ $script:DisclaimerText = @'
 
 在法律允许的最大范围内，作者不对使用或无法使用本工具所导致的任何直接、间接、附带或后果性损失承担责任，包括但不限于数据丢失、文件损坏、系统无法启动、业务中断及数据恢复费用；亦不对因误勾选、自行修改源码、用于违规用途、系统或硬件环境差异、以及第三方二次分发等情形造成的损失负责。
 
-五、其他
+五、关于二次修改
+
+本工具内置脚本完整性校验，脚本被改动后启动会被提示框拦下并停止运行。未经授权的二次修改与再分发与本工作室无关，其后果由发布者自行承担；修改版不得以本工作室名义发布，并应显著标明为非官方版本。解锁密钥仅限领取者本人使用，不得公开传播，也不得随修改版一并分发。
+
+六、其他
 
 本声明为 MIT 许可证的补充说明；若本声明与许可证条款就责任限制事项存在冲突，以对作者责任限制更严格者为准。
 
@@ -1965,13 +2636,29 @@ function Show-Gui {
     $titleBar.Controls.Add($lblApp)
 
     $lblVer = New-Object System.Windows.Forms.Label
-    $lblVer.Text = ('v' + $script:Version + '  ·  Miuix')
+    # 标题下面这一行：版本 · 界面风格 · 工作室署名。
+    # 三者用同一个分隔符串起来，保持一行读完；标签宽 320 逻辑单位，实测即使 200% 缩放也不会被裁掉。
+    $lblVer.Text = ('v' + $script:Version + '  ·  Miuix  ·  林中晨曦工作室')
     $lblVer.Font = $script:FCap
     $lblVer.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
     $lblVer.BackColor = [System.Drawing.Color]::Transparent
     $lblVer.Location = New-Object System.Drawing.Point((MxU 24), (MxU 36))
-    $lblVer.Size = New-Object System.Drawing.Size((MxU 320), (MxU 16))
-    $titleBar.Controls.Add($lblVer)
+$titleBar.Controls.Add($lblVer)
+
+    # 二改授权运行时（解锁密钥放行），在署名右边补一句红字把状态写明。
+    # 这不是装饰：重新打包分发的副本会带着它一起被终端用户看到，等于让「跳过了校验」这件事藏不住。
+    # 位置用同一支笔实测署名宽度后接上去，各种缩放比例下都跟着走，不会叠字。
+    if ($script:MxUnlocked) {
+        $lblWarn = New-Object System.Windows.Forms.Label
+        $lblWarn.Text = '已绕过完整性校验'
+        $lblWarn.Font = $script:FCap
+        $lblWarn.ForeColor = (Get-MxColor $script:Mx.Error)
+        $lblWarn.BackColor = [System.Drawing.Color]::Transparent
+        $warnX = (MxU 24) + [int][Math]::Ceiling($script:MxMeasure.MeasureString($lblVer.Text, $script:FCap).Width) + (MxU 12)
+        $lblWarn.Location = New-Object System.Drawing.Point($warnX, (MxU 36))
+        $lblWarn.Size = New-Object System.Drawing.Size((MxU 220), (MxU 16))
+        $titleBar.Controls.Add($lblWarn)
+    }
 
     $btnClose = New-MxCaptionButton -Kind 'Close'
     $btnClose.Location = New-Object System.Drawing.Point(($W - $PAD - $btnClose.Width - 1), (MxU 11))
@@ -2810,7 +3497,7 @@ function Show-Gui {
                     if (-not $script:MxDismDone) {
                         $script:MxRowCache[$i].SizeText = '计算中…'
                         Invalidate-MxRow $i
-                        Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
+                        Start-MxAsyncMeasure -Index $i -Path (Join-Path $script:MxWinDir 'WinSxS')
                         $deferred++
                     }
                     continue
@@ -3058,13 +3745,15 @@ function Show-Gui {
             if ($script:Entries[$i].Kind -eq 'Dism') {
                 $script:MxRowCache[$i].SizeText = '计算中…'
                 Invalidate-MxRow $i
-                Start-MxAsyncMeasure -Index $i -Path (Join-Path $env:SystemRoot 'WinSxS')
+                Start-MxAsyncMeasure -Index $i -Path (Join-Path $script:MxWinDir 'WinSxS')
                 break
             }
         }
         Write-Log ('=== ' + $script:AppName + ' v' + $script:Version + '  ·  Miuix 界面 ===')
         Write-Log ('管理员权限: ' + $script:IsAdmin + '   缩放: ' + [math]::Round($script:MxScale * 100) + '%')
         if (-not $script:IsAdmin) { Write-Log '提示：未以管理员身份运行，标注「需管理员权限」的项目将无法清理。' }
+        # 解锁模式必须写在日志里：这是「授权后自行改动」的状态，不能悄悄出现
+        if ($script:MxUnlockNotice) { Write-Log $script:MxUnlockNotice }
         # 把自动隐藏的明细写清楚：用户看不到某一项时，得能在日志里找到原因。
         if ($script:MxHiddenEntries.Count -gt 0) {
             Write-Log ('已按本机情况自动隐藏 ' + $script:MxHiddenEntries.Count + ' 项：本机没有对应的软件或目录（清单 ' + $script:Entries.Count + ' + 隐藏 ' + $script:MxHiddenEntries.Count + ' = ' + ($script:Entries.Count + $script:MxHiddenEntries.Count) + ' 项）')
@@ -3160,8 +3849,68 @@ function Invoke-SelfTest {
     $script:stFail = 0
 
     Write-Host ''
+    Write-Host '0) 文件完整性'
+    # 自检模式下不阻断（见 Assert-MxIntegrity 的调用处），所以这里把结果报出来：
+    # 改过脚本但忘了重新封装时，就靠这一条提醒。
+    # 刻意调用启动检查用的同一个函数：两边同源，才不会出现「自检通过但启动被拦」。
+    $stIntg = Get-MxIntegrityState
+    $sealedNow = $stIntg.Actual
+    Check '脚本指纹与封装值一致' ($stIntg.Issues.Count -eq 0) ('改动过脚本但没有重新封装，请运行 -IntegritySeal（' + ($stIntg.Issues -join '；') + '）')
+    # 加解密自洽：加一次再解一次必须回到原值（每次新 IV，密文会变但明文不变）
+    $rtInt = Unprotect-MxIntValue (Protect-MxIntValue $sealedNow)
+    Check '指纹加解密自洽' ($rtInt -eq $sealedNow) '加密后再解密得不到原指纹'
+    # 加密是否真的生效：明文指纹不该以字符串形式留在源码里
+    $selfText = ''
+    try { $selfText = [System.IO.File]::ReadAllText($script:MxSelfPath, [System.Text.Encoding]::UTF8) } catch { }
+    Check '明文指纹不在源码里' ($sealedNow.Length -eq 64 -and -not $selfText.Contains($sealedNow)) '明文指纹仍留在源码中，加密形同虚设'
+    # 解锁密钥：脚本里只该有单向校验值；错误密钥一律不能过
+    Check '解锁校验值为 64 位十六进制' ($script:MxUnlockVerifier -match '^[0-9A-F]{64}$') '校验值格式不对'
+    Check '错误密钥不能解锁' ((-not (Test-MxUnlockKey '')) -and (-not (Test-MxUnlockKey 'wrong-key')) -and (-not (Test-MxUnlockKey $sealedNow))) '错误密钥被判定为有效'
+    # 打包前哨：本地开发会把 unlock.key 放在程序目录，绝不能跟着发行包发出去
+    $ukLocal = Join-Path (Get-ScriptDir) 'unlock.key'
+    Check '程序目录没有解锁密钥文件（发行包不该带它）' (-not (Test-Path -LiteralPath $ukLocal)) ('发现 ' + $ukLocal + '，打包前必须删除')
+    # 自检全程只在临时目录里操作、不碰真实数据，所以这里直接把总闸打开，
+    # 好让下面「删除引擎」那几段能正常跑；否则 Test-SafePath 会一律拒绝，看着像大面积失败。
+    $script:MxIntegrityOk = $true
+    $fpMask = $stIntg.Blob
+    # 行尾归一化是这套指纹的前提，单独验一下：把内容原样加个 BOM、换成 CRLF，
+    # 指纹必须不变，否则从 git 检出或另存一次就会被误报成篡改。
+    $tmpFp = Join-Path $env:TEMP ('dc_fp_' + [guid]::NewGuid().ToString('N') + '.ps1')
+    try {
+        $t = [System.IO.File]::ReadAllText($script:MxSelfPath, [System.Text.Encoding]::UTF8)
+        if ($t.Length -gt 0 -and $t[0] -eq [char]0xFEFF) { $t = $t.Substring(1) }
+        $t = $t.Replace("`r`n", "`n")            # 换成纯 LF
+        [System.IO.File]::WriteAllText($tmpFp, $t, (New-Object System.Text.UTF8Encoding $false))
+        $fpLf = Get-MxFileFingerprint -Path $tmpFp -MaskValue $fpMask
+        $t2 = [System.IO.File]::ReadAllText($tmpFp, [System.Text.Encoding]::UTF8).Replace("`n", "`r`n")
+        [System.IO.File]::WriteAllText($tmpFp, $t2, (New-Object System.Text.UTF8Encoding $true))   # CRLF + BOM
+        $fpCrlf = Get-MxFileFingerprint -Path $tmpFp -MaskValue $fpMask
+        Check '行尾与 BOM 变化不误报' ($fpLf -eq $sealedNow -and $fpCrlf -eq $sealedNow) '同一内容在 LF/BOM 变体下算出的指纹不同'
+        # 反向验一次：真被改了内容就必须检出
+        [System.IO.File]::AppendAllText($tmpFp, [Environment]::NewLine + '# injected')
+        $fpBad = Get-MxFileFingerprint -Path $tmpFp -MaskValue $fpMask
+        Check '内容被追加必须检出' ($fpBad -ne $sealedNow) '追加内容后指纹没有变化'
+    } finally {
+        try { Remove-Item -LiteralPath $tmpFp -Force } catch { }
+    }
+
+    Write-Host ''
     Write-Host '1) 安全校验（应当被拒绝的路径）'
-    $danger = @('C:\', 'C:\Windows', 'C:\Users', $env:USERPROFILE, $env:LOCALAPPDATA, $env:ProgramFiles, $env:SystemRoot, (Get-ScriptDir))
+    $danger = @(
+        'C:\', 'C:\Windows', 'C:\Users', $env:USERPROFILE, $env:LOCALAPPDATA, $env:ProgramFiles, $env:SystemRoot, (Get-ScriptDir),
+        # 下面这些是「绕过黑名单」的写法，必须同样被拒绝：
+        # 末尾的点与空格（Win32 会忽略）、UNC、设备路径、8.3 短名，
+        # 以及落在系统关键目录树里面的路径（哪怕改的只是环境变量）。
+        'C:\Windows.', 'C:\Windows ', 'C:\Windows...',
+        '\\?\C:\Windows', '\\localhost\C$\Windows', 'C:\PROGRA~1', 'C:\WINDOW~1',
+        (Join-Path $script:MxWinDir 'System32\config'),
+        (Join-Path $script:MxWinDir 'System32\drivers'),
+        (Join-Path $script:MxWinDir 'System32\config\RegBack'),
+        (Join-Path $script:MxWinDir 'Fonts'),
+        (Join-Path $script:MxPfDir 'SomeApp'),
+        (Join-Path $script:MxUpDir 'Documents\sub'),
+        (Join-Path $script:MxAdDir 'Microsoft\Crypto\RSA')
+    )
     foreach ($d in $danger) {
         if ([string]::IsNullOrWhiteSpace($d)) { continue }
         Check ("拒绝 " + $d) (-not (Test-SafePath $d)) '安全校验未拦截'
@@ -3171,6 +3920,20 @@ function Invoke-SelfTest {
     Write-Host '2) 安全校验（应当被允许的路径）'
     $root = Join-Path $env:TEMP ('dc_selftest_' + [guid]::NewGuid().ToString('N'))
     Check ("允许 " + $root) (Test-SafePath $root) '正常路径被误拦'
+    # 真正的清理目标不能被新加的目录树名单误伤（这类误伤会让功能悄悄失效）
+    foreach ($ok in @(
+        (Join-Path $script:MxWinDir 'Logs'),
+        (Join-Path $script:MxWinDir 'Temp'),
+        (Join-Path $script:MxWinDir 'SoftwareDistribution\Download'),
+        (Join-Path $script:MxWinDir 'System32\LogFiles'),
+        (Join-Path $script:MxLaDir 'Microsoft\Windows\INetCache'),
+        (Join-Path $script:MxAdDir 'Adobe\Common\Media Cache'),
+        (Join-Path $script:MxUpDir '.cargo\registry\cache'),
+        (Join-Path $script:MxPdDir 'Package Cache'),
+        ($script:MxSysDrive + '\Windows.old')
+    )) {
+        Check ("允许 " + $ok) (Test-SafePath $ok) '合法清理目标被误拦'
+    }
 
     Write-Host ''
     Write-Host '3) 嵌套目录 + 只读文件清理（保留根目录）'
@@ -3189,6 +3952,35 @@ function Invoke-SelfTest {
         Check '根目录被保留' (Test-Path -LiteralPath $root) '根目录被误删'
         Check '只读文件也能删除' (-not (Test-Path -LiteralPath $ro)) '只读文件残留'
         Check '清理前有内容' ($before -gt 0) '测试数据未生成'
+
+        # 联结点（junction / 重解析点）必须只摘链子，绝不能跟进目标目录树：
+        # 跟进的话，「清只读」会把目标目录里的文件属性改掉，「删目录」会把目标内容删掉，
+        # 而那些文件根本不在清理目标范围内。目标目录特意建在链外的 %TEMP% 下。
+        $dest = Join-Path $env:TEMP ('dc_selftest_dest_' + [guid]::NewGuid().ToString('N'))
+        $linkDir = Join-Path $root 'linkdir'
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        $guardRO = Join-Path $dest 'guard_ro.dat'
+        $guardPl = Join-Path $dest 'guard_plain.dat'
+        [System.IO.File]::WriteAllText($guardRO, 'g')
+        [System.IO.File]::WriteAllText($guardPl, 'p')
+        (Get-Item -LiteralPath $guardRO).Attributes = [System.IO.FileAttributes]::ReadOnly
+        $made = $false
+        try {
+            $null = New-Item -ItemType Junction -Path $linkDir -Target $dest -ErrorAction Stop
+            $made = (Test-Path -LiteralPath (Join-Path $linkDir 'guard_plain.dat'))
+        } catch { $made = $false }
+        if ($made) {
+            try { Clear-ReadOnlyRecursive -Path $linkDir } catch { }
+            Check '清只读不穿过联结点' ((([System.IO.File]::GetAttributes($guardRO)) -band [System.IO.FileAttributes]::ReadOnly) -ne 0) '目标目录里的只读属性被清掉了'
+            $null = Remove-PathPermanent -Path $linkDir
+            Check '删目录不穿过联结点' (Test-Path -LiteralPath $guardPl) '目标目录的内容被删掉了'
+            Check '联结链子本身被摘除' (-not (Test-Path -LiteralPath $linkDir)) '链接残留'
+        } else {
+            Check '联结点测试（本机不支持建链则跳过）' $true ''
+        }
+        try { [System.IO.File]::SetAttributes($guardRO, [System.IO.FileAttributes]::Normal) } catch { }
+        try { Remove-Item -LiteralPath $dest -Recurse -Force } catch { }
+        try { Remove-Item -LiteralPath $linkDir -Recurse -Force } catch { }
     } catch {
         Check '嵌套目录测试' $false $_.Exception.Message
     }

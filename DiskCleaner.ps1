@@ -90,7 +90,7 @@ function Get-ScriptDir {
 $script:MxIntP1   = 'emY4aThIbkpxTEZ1'
 $script:MxIntP2   = 'OTg0OUxUVGNBNDlM'
 $script:MxIntSalt = 'cQXnbhvNdxUv/LZ4zLlCGQ=='
-$script:MxIntBlob = '8YOPrYUcFYga1uayWyygFiFIcdqB2q/vyrCZb7ikRmQ0mzeqNKi87zyMdUmP0vtf3joRYFaSQAyYpdMQQO2Fmm8W/MQbE1IVjOrGkPMKGgZOtaXl03inGHQi7QF+2hEK'
+$script:MxIntBlob = 'RtcFCd3JN8jV0FioJWpTx0NqTuI5FC+SEgqIGpkEFc5TmmBZVoOqgBffR6MEphTqauFr5BeKTEqFTrAsxgqfcdQHvPtAPiCQKpqLMrv4wSTcRzb1g6XX6VaEJDmF9t47'
 
 # 删除引擎的总闸：只有完整性校验通过才会置真，判断在 Test-SafePath 里。
 # 意义是「把校验拆掉反而让工具彻底不干活」——删掉检查换不来一个能随便删文件的副本。
@@ -2637,28 +2637,35 @@ function Show-Gui {
 
     $lblVer = New-Object System.Windows.Forms.Label
     # 标题下面这一行：版本 · 界面风格 · 工作室署名。
-    # 三者用同一个分隔符串起来，保持一行读完；标签宽 320 逻辑单位，实测即使 200% 缩放也不会被裁掉。
+    # 三者用同一个分隔符串起来，保持一行读完。
+    # 宽度按实测文字宽度收紧（Label 用 GDI 渲染，而 MeasureString 是 GDI+、测出来偏窄，
+    # 所以这里用 TextRenderer 量），再留 MxU 6 的余量，任何缩放下都不会被裁掉。
+    # 不能像早先那样固定给 400px：透明背景的标签会用父容器底色重绘自己整块区域，
+    # 右侧的红字（x 起点紧跟署名之后）正好落在里面，会被整段擦掉——宽度收到刚好放下即可。
     $lblVer.Text = ('v' + $script:Version + '  ·  Miuix  ·  林中晨曦工作室')
     $lblVer.Font = $script:FCap
     $lblVer.ForeColor = (Get-MxColor $script:Mx.OnSurfaceContainerVariant)
     $lblVer.BackColor = [System.Drawing.Color]::Transparent
     $lblVer.Location = New-Object System.Drawing.Point((MxU 24), (MxU 36))
-    $lblVer.Size = New-Object System.Drawing.Size((MxU 320), (MxU 16))
+    $verW = [System.Windows.Forms.TextRenderer]::MeasureText($lblVer.Text, $script:FCap).Width + (MxU 6)
+    $lblVer.Size = New-Object System.Drawing.Size($verW, (MxU 16))
     $titleBar.Controls.Add($lblVer)
 
     # 二改授权运行时（解锁密钥放行），在署名右边补一句红字把状态写明。
     # 这不是装饰：重新打包分发的副本会带着它一起被终端用户看到，等于让「跳过了校验」这件事藏不住。
-    # 位置用同一支笔实测署名宽度后接上去，各种缩放比例下都跟着走，不会叠字。
+    # 位置接在副标题标签的右边（标签宽度已收到实测值，所以不会叠字），并显式提到最前——
+    # 万一将来右边的标签又变宽，红字也仍然画在最上层，不会再被擦掉。
     if ($script:MxUnlocked) {
         $lblWarn = New-Object System.Windows.Forms.Label
         $lblWarn.Text = '已绕过完整性校验'
         $lblWarn.Font = $script:FCap
         $lblWarn.ForeColor = (Get-MxColor $script:Mx.Error)
         $lblWarn.BackColor = [System.Drawing.Color]::Transparent
-        $warnX = (MxU 24) + [int][Math]::Ceiling($script:MxMeasure.MeasureString($lblVer.Text, $script:FCap).Width) + (MxU 12)
+        $warnX = $lblVer.Left + $lblVer.Width + (MxU 12)
         $lblWarn.Location = New-Object System.Drawing.Point($warnX, (MxU 36))
         $lblWarn.Size = New-Object System.Drawing.Size((MxU 220), (MxU 16))
         $titleBar.Controls.Add($lblWarn)
+        $lblWarn.BringToFront()
     }
 
     $btnClose = New-MxCaptionButton -Kind 'Close'

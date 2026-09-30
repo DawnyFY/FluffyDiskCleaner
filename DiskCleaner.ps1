@@ -32,7 +32,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($SelfTest -or $Console -or $RenderTo -or $BenchPaint -or $SnapTo -or $IntegritySeal) { $ErrorActionPreference = 'Continue' }
 
 $script:AppName  = 'C 盘清理工具'
-$script:Version  = '1.5.4'
+$script:Version  = '1.5.5'
 $script:IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $script:Abort    = $false
 $script:Cleaning = $false
@@ -90,7 +90,7 @@ function Get-ScriptDir {
 $script:MxIntP1   = 'emY4aThIbkpxTEZ1'
 $script:MxIntP2   = 'OTg0OUxUVGNBNDlM'
 $script:MxIntSalt = 'cQXnbhvNdxUv/LZ4zLlCGQ=='
-$script:MxIntBlob = 'Kkn79c9JzrA0/KmJSjCwEIXo8lt5pIghBg1epp261pAyMVyXgIcVdTf85RQmuQUEoLul3BEvZCRQkM21Np/fFZpCLno4lsoP+GHBaBEFqbp/JmcG5F4WAIEMWybxqHYg'
+$script:MxIntBlob = 'p//BjkFH18TLzsgHahhgLOqy2b3xWk/ytosMYUyZOWMPhjniiqGUqyz6XjrEnoSdlWwXPyJl8piZhAinqIDI4bRUlALjuAEX8NYZpsACI7EeL9gl0QfdtIWpEER+X2ar'
 
 # 删除引擎的总闸：只有完整性校验通过才会置真，判断在 Test-SafePath 里。
 # 意义是「把校验拆掉反而让工具彻底不干活」——删掉检查换不来一个能随便删文件的副本。
@@ -348,9 +348,6 @@ function Get-MxIntegrityState {
     $blob     = $script:MxIntBlob
     $expected = Unprotect-MxIntValue $blob
     $actual   = ''
-    $sidePath = ''
-    $sideValue = ''
-    $hasSide  = $false
 
     if ([string]::IsNullOrWhiteSpace($path)) {
         # 定位不到自身（例如把脚本内容直接喂给 iex）：无从校验，按通过处理。
@@ -367,28 +364,10 @@ function Get-MxIntegrityState {
         } elseif (-not (Test-MxHashEqual $actual $expected)) {
             [void]$issues.Add('脚本内容指纹与封装值不一致')
         }
-
-        # 同目录若放了随发行包附带的 DiskCleaner.sha256，也一并核对。
-        # 它挡的是「两个不同版本的文件被混在一起」这类事故；没有这个文件不算问题。
-        # 比的是密文而不是明文：免得这个校验文件变成明文指纹的泄露口。
-        $sidePath = Join-Path (Split-Path -Parent $path) 'DiskCleaner.sha256'
-        $hasSide  = (Test-Path -LiteralPath $sidePath)
-        if ($hasSide) {
-            try {
-                foreach ($ln in [System.IO.File]::ReadAllLines($sidePath)) {
-                    $s = $ln.Trim()
-                    if (-not $s -or $s.StartsWith('#')) { continue }
-                    $sideValue = ($s -split '\s+')[0]
-                    break
-                }
-            } catch { $sideValue = '' }
-            if ($sideValue -and ($sideValue -cne $blob)) { [void]$issues.Add('随附的 DiskCleaner.sha256 与脚本里的密文不一致（两个文件可能来自不同版本）') }
-        }
     }
 
     return [PSCustomObject]@{
         Path = $path; Expected = $expected; Actual = $actual; Blob = $blob
-        SidePath = $sidePath; SideValue = $sideValue; HasSide = $hasSide
         Issues = $issues
     }
 }
@@ -406,9 +385,6 @@ function Assert-MxIntegrity {
     $expected = $st.Expected
     $actual = $st.Actual
     $issues = $st.Issues
-    $sidePath = $st.SidePath
-    $sideValue = $st.SideValue
-    $hasSide = $st.HasSide
 
     $size  = 0
     $lines = 0
@@ -418,10 +394,6 @@ function Assert-MxIntegrity {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('脚本文件：' + $path)
     [void]$sb.AppendLine(('文件大小：{0:N0} 字节    行数：{1}' -f $size, $lines))
-    if ($hasSide) {
-        $show = if ($sideValue.Length -ge 16) { $sideValue.Substring(0, 16) + '…' } else { $sideValue }
-        [void]$sb.AppendLine('校验文件：' + $sidePath + '  （值 ' + $show + '）')
-    }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('期望指纹（以密文存放，这里只给前 8 位——完整值不该交给改文件的人）：')
     [void]$sb.AppendLine('  ' + $(if ($expected.Length -ge 8) { $expected.Substring(0, 8) + '…' } else { '(密文无法解密)' }))
@@ -433,7 +405,9 @@ function Assert-MxIntegrity {
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('常见原因：下载 / 传输 / 解压不完整，或用编辑器打开后保存过、被别的脚本改过。')
     [void]$sb.AppendLine('处理办法：从官方仓库重新下载一份，覆盖当前文件。')
-    [void]$sb.AppendLine('如果这处改动本来就是你做的，那是预期行为，重新封装指纹即可：')
+    [void]$sb.AppendLine('如果这处改动本来就是你做的，那是预期行为，重新封装指纹即可。')
+    [void]$sb.AppendLine('注意：重新封装需要有效的二改授权解锁密钥（与解锁共用同一道门，见 README）：')
+    [void]$sb.AppendLine('  把密钥写进程序同目录的 unlock.key，或者用 -UnlockKey 传入。')
     [void]$sb.AppendLine('  powershell -ExecutionPolicy Bypass -File "' + $path + '" -IntegritySeal')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('注意：脚本被整个删除时它自己无法报错，那种情况只会表现为双击或计划任务找不到文件。')
@@ -454,6 +428,24 @@ function Assert-MxIntegrity {
 
 # 维护入口：改过脚本后用它重新封装。必须放在断言之前，否则封装动作会被自己拦下。
 if ($IntegritySeal) {
+    # 授权门槛：重新封装等于「把改动合法化」，所以它必须和二改解锁走同一道门。
+    # 否则「改几行 -> 跑一次 -IntegritySeal」就是一条零成本旁路，而且封装出来的副本
+    # 不带任何标记、看起来与官方版本完全一样——那正是这套校验声明要防的场景。
+    # 说明：本项目源码公开，这道门是「先问一声」的软性约束，不是密码学屏障。
+    $sealKey = Get-MxPresentedUnlockKey -Given $UnlockKey
+    if (-not ($sealKey -and (Test-MxUnlockKey $sealKey))) {
+        Write-Host '*** 已拒绝封装：缺少有效的二改授权解锁密钥 ***'
+        Write-Host ''
+        Write-Host '重新封装会把脚本改动合法化，因此与二改解锁共用同一道门。两种带法：'
+        Write-Host '  1)（推荐）把密钥单独写进程序同目录的 unlock.key'
+        Write-Host '  2) 命令行传入：powershell -ExecutionPolicy Bypass -File .\DiskCleaner.ps1 -IntegritySeal -UnlockKey "<密钥>"'
+        Write-Host ''
+        if ($sealKey) { Write-Host '提示：提供的解锁密钥无效。' } else { Write-Host '提示：本次没有提供解锁密钥。' }
+        Write-Host '密钥申请方式见 README 的「二改与完整性校验」一节；封装流程见开发文档 §6.5 与 §13.1。'
+        exit 4
+    }
+    Write-Host '已确认二改授权密钥有效，开始封装。'
+    Write-Host ''
     $sealPath = $script:MxSelfPath
     if ([string]::IsNullOrWhiteSpace($sealPath) -or -not (Test-Path -LiteralPath $sealPath)) {
         Write-Host '找不到脚本自身，无法封装。'
@@ -528,13 +520,6 @@ if ($IntegritySeal) {
                 $afterText  = [System.Text.Encoding]::UTF8.GetString($afterBytes)
                 $afterBare  = ([regex]::Matches($afterText, "(?<!`r)`n")).Count
                 Write-Host ('文件形态：BOM ' + $(if ($afterBom) { '保留' } else { '丢失' }) + '（封装前 ' + $(if ($hasBom) { '有' } else { '无' }) + '），裸 LF ' + $afterBare + ' 处')
-                # 同目录有 DiskCleaner.sha256 就一并更新（发行包里带的那个）
-                $side = Join-Path (Split-Path -Parent $sealPath) 'DiskCleaner.sha256'
-                if (Test-Path -LiteralPath $side) {
-                    $txt = '# DiskCleaner 脚本指纹密文（与同目录 DiskCleaner.ps1 里的 MxIntBlob 一致）' + [Environment]::NewLine + $diskBlob + [Environment]::NewLine
-                    [System.IO.File]::WriteAllText($side, $txt, (New-Object System.Text.UTF8Encoding $false))
-                    Write-Host ('已同步更新：' + $side)
-                }
                 Write-Host ''
                 Write-Host '对外公布用的原样 SHA256（别人可用 Get-FileHash -Algorithm SHA256 独立复核）：'
                 Write-Host ('  ' + (Get-MxPlainHash -Path $sealPath))
@@ -806,8 +791,14 @@ public static class MxFastSize
 
     public static long Get(string path, int threads)
     {
-        if (File.Exists(path)) { try { return new FileInfo(path).Length; } catch { return 0; } }
-        if (!Directory.Exists(path)) { return 0; }
+        // 用 FileInfo / DirectoryInfo 读目录项元数据，不用静态 File.Exists / Directory.Exists：
+        // 与纯 PowerShell 回退分支（Get-PathSize）保持同一套判断，避免两条路径口径不一致。
+        // 说明：ACL 受限时 FileInfo.Exists / DirectoryInfo.Exists 同样会返回 false，
+        // 这一改动是口径统一，不是「能读到权限外目录」的银弹。
+        var fiHead = new FileInfo(path);
+        if (fiHead.Exists) { try { return fiHead.Length; } catch { return 0; } }
+        var diHead = new DirectoryInfo(path);
+        if (!diHead.Exists) { return 0; }
         if (threads < 1) { threads = 1; }
 
         long direct = 0;
@@ -1057,6 +1048,84 @@ function Clear-ReadOnlyRecursive {
     }
 }
 
+# ---------- 解析重解析点（联结点 / 符号链接）后的真实落点 ----------
+# 为什么需要：Test-SafePath 只比对路径**字符串**。清理目标一旦本身是重解析点，
+# 枚举它的内容时会落到链外的目标目录上，字符串校验完全看不出来——这是 v1.5.4 里
+# 一个真实漏洞（详见 Remove-PathPermanent 内的说明与自检第 3 组的回归用例）。
+#
+# 取值逐级降级，都拿不到就返回空串（由调用方按「判断不了」处理）：
+#   1) GetFinalPathNameByHandleW —— 一次调用解析整条链（含父级联结点），最可靠。
+#      但它对 ACL 受限路径会失败（ERROR_ACCESS_DENIED）、对 hiberfil.sys 这类被占用的
+#      文件也会失败（ERROR_SHARING_VIOLATION），所以只能当「能拿到就更严」的增强，
+#      不能作为 fail-closed 的唯一依据。
+#   2) Get-Item ... .Target —— 纯 PowerShell 退路；Add-Type 被策略禁用时仍可用。
+#   3) 空串（判断不了）。
+$script:MxRealOk = $null
+function Initialize-MxRealPath {
+    if ($null -ne $script:MxRealOk) { return $script:MxRealOk }
+    if ('MxNative.PathResolver' -as [type]) { $script:MxRealOk = $true; return $true }
+    try {
+        Add-Type -Namespace MxNative -Name PathResolver -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+    IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern uint GetFinalPathNameByHandleW(IntPtr hFile, System.Text.StringBuilder lpszFilePath,
+    uint cchFilePath, uint dwFlags);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr hObject);
+public static string Resolve(string path)
+{
+    IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+    if (h == new IntPtr(-1)) return "";
+    try
+    {
+        var sb = new System.Text.StringBuilder(2048);
+        uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+        if (n == 0 || n >= sb.Capacity) return "";
+        string s = sb.ToString();
+        if (s.StartsWith(@"\\?\")) s = s.Substring(4);
+        return s;
+    }
+    finally { CloseHandle(h); }
+}
+'@ -ErrorAction Stop
+        $script:MxRealOk = $true
+    } catch { $script:MxRealOk = $false }
+    return $script:MxRealOk
+}
+
+function Get-MxRealPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    if (Initialize-MxRealPath) {
+        try {
+            $r = [MxNative.PathResolver]::Resolve($Path)
+            if (-not [string]::IsNullOrWhiteSpace($r)) { return $r }
+        } catch { }
+    }
+    try {
+        $t = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).Target
+        if ($t) {
+            $s = [string]($t | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($s)) { return $s }
+        }
+    } catch { }
+    return ''
+}
+
+# 路径自身是不是重解析点。三态：yes / no / unknown（读不到属性）。
+# 为什么要有 unknown 这一态：hiberfil.sys 的属性读得到（=no），不该被误拦；
+# 而 Defender 的 Scans\History 这类 ACL 受限路径读属性会抛异常（=unknown），
+# 此时无法排除它指向别处，只能如实报告并跳过，不能假装它没问题。
+function Get-MxReparseState {
+    param([string]$Path)
+    try {
+        if ((([System.IO.File]::GetAttributes($Path)) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return 'yes' }
+        return 'no'
+    } catch { return 'unknown' }
+}
+
 function Remove-PathPermanent {
     param([string]$Path, [switch]$KeepRoot)
     if (-not (Test-SafePath $Path)) { return @{ Ok = $false; Msg = '安全校验未通过，已跳过' } }
@@ -1064,6 +1133,40 @@ function Remove-PathPermanent {
     # 结果是本该清的项目被静默跳过（详见 Test-MxPathAbsent 上的说明）。
     # 这里改为「确定不存在才跳过」，判断不了就照常尝试删除，失败会明写在日志里。
     if (Test-MxPathAbsent -Path $Path) { return @{ Ok = $true; Msg = '不存在' } }
+
+    # ---------- 重解析点把关（必须在「不存在」判断之后）----------
+    # 安全校验只看路径**字符串**，看不出这个路径其实是个联结点 / 符号链接。而清理目标
+    # 一旦本身是联结点，下面的 Get-ChildItem -LiteralPath 会枚举到**链外**目标目录的
+    # 内容并逐个删掉——等于以管理员身份删任意目录。
+    # 实测（v1.5.4）：受限用户把自己的 %TEMP%（= %LOCALAPPDATA%\Temp，本身能通过路径
+    # 校验）换成指向 C:\Windows\System32\config 的联结点，再等管理员运行本工具即可命中。
+    # 所以删除前先把真实落点解析出来，对**真实路径**再跑一次同一套校验：
+    #   · 解析得到、且与原路径不同 -> 对真实路径复检：合法重定向（TEMP 指向内存盘之类）
+    #     放行，恶意重定向被拦下
+    #   · 解析不到、而路径自身是重解析点 -> 判断不了指向哪里，拒绝
+    #   · 解析不到、属性也读不到 -> 无法排除它是链接，拒绝并说明
+    #   · 解析不到、属性读得到且不是链接 -> 按原有逻辑继续
+    #     （hiberfil.sys 就走这一支：CreateFile 会因共享冲突失败，但它不是链接）
+    $mxReal = Get-MxRealPath -Path $Path
+    if (-not [string]::IsNullOrWhiteSpace($mxReal)) {
+        $mxRealTrim = $mxReal.TrimEnd('\')
+        $mxSelfTrim = $Path.TrimEnd('\')
+        try { $mxSelfTrim = ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\') } catch { }
+        if (-not ($mxRealTrim -ieq $mxSelfTrim)) {
+            if (-not (Test-SafePath $mxReal)) {
+                return @{ Ok = $false; Msg = ('目标经重解析点指向 ' + $mxReal + '，对该位置的安全校验未通过，已跳过') }
+            }
+            Write-Log ('    注意：目标经重解析点解析为 ' + $mxReal)
+        }
+    } else {
+        $mxRp = Get-MxReparseState -Path $Path
+        if ($mxRp -eq 'yes') {
+            return @{ Ok = $false; Msg = '目标自身是重解析点（联结点 / 符号链接）且无法解析其真实落点，已跳过' }
+        }
+        if ($mxRp -eq 'unknown') {
+            return @{ Ok = $false; Msg = '无法读取目标属性，无法排除它指向别处，已跳过（以管理员身份运行可正常判断）' }
+        }
+    }
 
     $isDir = -not (New-Object System.IO.FileInfo($Path)).Exists
     $failed = New-Object System.Collections.ArrayList
@@ -1181,7 +1284,11 @@ function Get-Catalog {
     ) '低' $true $false))
     [void]$list.Add((New-Entry 'DevCache' '开发工具缓存' 'pip / npm / yarn / NuGet / Go / Cargo / Gradle 等包管理器下载缓存' 'DirContent' @(
         "$la\pip\Cache", "$la\npm-cache", "$ad\npm-cache", "$la\Yarn\Cache", "$la\Yarn\Berry\cache",
-        "$la\NuGet\v3-cache", "$la\NuGet\plugins-cache", "$la\go-build", "$up\.cache", "$up\.cargo\registry\cache",
+        # 刻意**不**列 "$up\.cache"：那是整个 %USERPROFILE%\.cache，现代开发环境里常放着
+        # HuggingFace / torch 等已下载的模型与数据集，删掉意味着要重新下载几十 GB，
+        # 与本项「低风险、默认勾选、随时可清」的定位不符（本项说明里也没有它）。
+        # 若将来要收，应作为独立的中风险项并只列明确的子目录（如 .cache\pip），不要整棵收。
+        "$la\NuGet\v3-cache", "$la\NuGet\plugins-cache", "$la\go-build", "$up\.cargo\registry\cache",
         "$up\.gradle\wrapper\dists", "$up\.gradle\daemon"
     ) '低' $true $false))
     [void]$list.Add((New-Entry 'INetCache' '系统网络缓存' 'WinINet / IE 模式网络缓存目录' 'DirContent' @("$la\Microsoft\Windows\INetCache") '低' $true $false))
@@ -1259,7 +1366,10 @@ function Get-Catalog {
     # 只列系统级会漏掉用户级，两者路径不重叠，所以一并计入。
     [void]$list.Add((New-Entry 'PkgCache' '安装包缓存 (Package Cache)' 'VS / VC++ 安装缓存，删除后修复或卸载软件时可能要重下' 'DirContent' @("$pd\Package Cache", "$la\Package Cache") '中' $false $true))
     [void]$list.Add((New-Entry 'EventLog' '系统事件日志' '清空事件查看器中的日志内容' 'EventLog' @() '中' $false $true))
-    [void]$list.Add((New-Entry 'Dism' 'Windows 组件清理 (DISM)' '清理 WinSxS 中的旧组件，耗时较长，清理后无法回滚已装更新' 'Dism' @() '中' $false $true))
+    # 尺寸口径要注意：这一项在界面上显示的是**组件库当前占用**，不是可释放量，
+    # 因此它不计入「可清理合计」与环形图（见 Measure-Entry 的 'Dism' 分支）。
+    # 旧版把整个 WinSxS 当成可清理量，会把合计虚增十几 GB，而实际释放往往只有几百 MB。
+    [void]$list.Add((New-Entry 'Dism' 'Windows 组件清理 (DISM)' '清理 WinSxS 中的旧组件，耗时较长，清理后无法回滚已装更新；量列是组件库当前占用，不代表可释放量' 'Dism' @() '中' $false $true))
     [void]$list.Add((New-Entry 'AdobeMediaCache' 'Adobe 媒体缓存' 'Premiere / After Effects 等生成的媒体缓存，删除后需重新生成' 'DirContent' @(
         "$ad\Adobe\Common\Media Cache",
         "$ad\Adobe\Common\Media Cache Files",
@@ -1529,7 +1639,15 @@ function Measure-Entry {
             $Entry.Size = Get-PathSize (Join-Path $script:MxSysRoot 'hiberfil.sys')
         }
         'Dism' {
-            $Entry.Size = Get-PathSize (Join-Path $script:MxWinDir 'WinSxS')
+            # 这一项的量列显示「组件库当前占用」，并且**不进入**任何合计：
+            # WinSxS 里绝大部分是当前生效的系统组件，StartComponentCleanup 能回收的只是
+            # 其中的旧组件。把整个组件库算成「可清理」，会把环形图与「可清理合计」
+            # 虚增十几 GB，而实际释放往往只有几百 MB（旧版就这样，且执行后固定报 0）。
+            # Size 保持 0，SizeText 承担展示，这样 Update-MxSummary 的各路求和天然不含它。
+            $ws = Get-PathSize (Join-Path $script:MxWinDir 'WinSxS')
+            $Entry.Size = [double]0
+            $Entry.SizeText = '组件库 ' + (Format-Size $ws)
+            Write-Log ('    WinSxS 组件库当前占用 ' + (Format-Size $ws) + '（不代表可释放量）')
         }
         'RestorePoint' {
             # 行内描述必须短：这一列只有 639 像素（列表 920 减去左右留白、开关与尺寸列），
@@ -1629,13 +1747,20 @@ function Invoke-Entry {
         }
 
         'Dism' {
+            # 释放量按组件库的实际变化算，不再固定报 0。
+            # 注意 DISM 的 /StartComponentCleanup 回收的是旧组件，组件库总量下降通常不多；
+            # 测出来的差值才是诚实的「本次释放」，量列显示的组件库占用不是可释放量。
+            $ws = Join-Path $script:MxWinDir 'WinSxS'
+            $before = Get-PathSize $ws
             try {
                 $p = Start-Process -FilePath (Join-Path $script:MxWinDir 'System32\Dism.exe') `
                                    -ArgumentList '/Online', '/Cleanup-Image', '/StartComponentCleanup' `
                                    -Wait -PassThru -NoNewWindow -ErrorAction Stop
                 Write-Log ('    DISM 退出码: ' + $p.ExitCode)
             } catch { Write-Log ('    DISM 执行失败: ' + $_.Exception.Message) }
-            $freed = 0
+            $after = Get-PathSize $ws
+            $freed = [Math]::Max(0, $before - $after)
+            Write-Log ('    组件库 ' + (Format-Size $before) + ' → ' + (Format-Size $after) + '（差值才是本次释放）')
         }
 
         'RestorePoint' {
@@ -1857,6 +1982,9 @@ $script:Mx = @{
 $script:MxRadius = 16
 $script:MxDpi = 96
 $script:MxScale = 1.0
+# 布局适配系数：屏幕可用区域放不下设计尺寸时统一缩小（在 Show-Gui 里算）。
+# 不建界面的模式（控制台 / 自检）保持 1.0。
+$script:MxFit = 1.0
 
 # ---------- DPI 感知（必须在创建任何窗口之前调用）----------
 
@@ -1893,8 +2021,8 @@ function Initialize-MxDpiAwareness {
 
 # ---------- 缩放助手（布局用逻辑单位，按 DPI 换算成像素）----------
 
-function MxU  { param([double]$v) return [int][Math]::Round($v * $script:MxScale) }
-function MxUF { param([double]$v) return ($v * $script:MxScale) }
+function MxU  { param([double]$v) return [int][Math]::Round($v * $script:MxScale * $script:MxFit) }
+function MxUF { param([double]$v) return ($v * $script:MxScale * $script:MxFit) }
 
 # ---------- 颜色 / 画刷 / 画笔 缓存 ----------
 
@@ -1981,8 +2109,12 @@ function New-MxFont {
     param(
         [double]$Size,
         [System.Drawing.FontStyle]$Style = [System.Drawing.FontStyle]::Regular,
-        [string[]]$Names
+        [string[]]$Names,
+        # 字号按磅给，GDI 已按真实 DPI 换算成像素，所以这里只再乘一次布局适配系数。
+        # 启动动画的落款字号走 MxUF（其中已含适配系数），传 -NoFit 避免重复缩放。
+        [switch]$NoFit
     )
+    if (-not $NoFit) { $Size = $Size * $script:MxFit }
     if (-not $Names) { $Names = @('MiSans', 'MiSans Normal', 'Microsoft YaHei UI', 'Microsoft YaHei', 'SimSun', 'Arial') }
     foreach ($n in $Names) {
         try {
@@ -2520,6 +2652,27 @@ function Show-Gui {
     # 关键：先声明 DPI 感知，再创建任何窗口，否则整个窗口会被系统位图放大而发虚
     Initialize-MxDpiAwareness
 
+    # ---- 布局适配：整块布局必须放得进屏幕可用区域 ----
+    # 设计尺寸是 1180×828 逻辑单位，按真实 DPI 换算成物理像素后：
+    #   1920×1080 @150% 需要 1770×1242（超出约 200px）
+    #   1366×768  @100% 需要 1180×828 （超出约 100px）
+    # 而窗口既不能最大化、也没有滚动容器，于是底部「开始清理」与自绘标题栏按钮会被
+    # 裁到屏幕外、根本点不到。这里按主屏可用区域求一个统一缩放系数，MxU / MxUF 与
+    # 字号一起收，保证整块布局始终放得下。下限 0.5：再小字号就没法读了，
+    # 宁可接受「极小屏 + 极高缩放」这种极端组合下的轻微裁切。
+    $script:MxFit = 1.0
+    try {
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        if ($wa.Width -gt 0 -and $wa.Height -gt 0) {
+            $needW = 1180.0 * $script:MxScale
+            $needH = 828.0 * $script:MxScale
+            $fit = [Math]::Min(($wa.Width / $needW), ($wa.Height / $needH))
+            if ($fit -gt 1.0) { $fit = 1.0 }
+            if ($fit -lt 0.5) { $fit = 0.5 }
+            $script:MxFit = $fit
+        }
+    } catch { $script:MxFit = 1.0 }
+
     # ---- Miuix 排版 ----
     # 字体尺寸用「磅」：GDI/GDI+ 会按真实 DPI 自动换算像素，
     # 因此这里不需要乘缩放系数，否则会双重放大。
@@ -2538,6 +2691,8 @@ function Show-Gui {
     $script:MxSfFar.LineAlignment = [System.Drawing.StringAlignment]::Center
 
     # 测量用 Graphics，分辨率必须设成当前 DPI，否则文字宽度按 96 DPI 算会偏小
+    # 这个 Bitmap 看起来「只赋值、不读取」，但必须留着：$script:MxMeasure 是从它创建的
+    # Graphics，位图一旦被 GC 回收，那个 Graphics 的底层 HDC 就会失效。
     $script:MxMeasureBmp = New-Object System.Drawing.Bitmap(1, 1)
     $script:MxMeasureBmp.SetResolution($script:MxDpi, $script:MxDpi)
     $script:MxMeasure = [System.Drawing.Graphics]::FromImage($script:MxMeasureBmp)
@@ -2708,8 +2863,6 @@ function Show-Gui {
     $script:MxChart = @{
         Total = [double]0; Used = [double]0; Free = [double]0
         CleanAll = [double]0; CleanSel = [double]0
-        Unsel = [double]0; OtherUsed = [double]0
-        Items = 0; SelCount = 0
         TotalText = '共 0 B'
         LowText = '低 0 项  0 B'; MidText = '中 0 项  0 B'; HighText = '高 0 项  0 B'
         Values = @([double]0, [double]0, [double]0, [double]0)   # 四段数值，绘制与命中检测共用
@@ -3296,8 +3449,6 @@ function Show-Gui {
         if ($otherUsed -lt 0) { $otherUsed = [double]0 }
         $unsel = [double]$c.CleanAll - [double]$c.CleanSel
         if ($unsel -lt 0) { $unsel = [double]0 }
-        $c.OtherUsed = $otherUsed
-        $c.Unsel     = $unsel
         # 百分比与扇形使用同一分母，避免「可清理 > 已用」被截断时
         # 图形角度与图例数字对不上（正常情况下该分母就等于磁盘总容量）
         $denom = [double]$c.CleanSel + $unsel + $otherUsed + [double]$c.Free
@@ -3368,8 +3519,6 @@ function Show-Gui {
         $c = $script:MxChart
         $c.CleanSel = $sum
         $c.CleanAll = $all
-        $c.SelCount = $sel.Count
-        $c.Items    = $script:Entries.Count
         $c.LowText  = ('低 ' + $lowN + ' 项 ' + (Format-Size $lowS))
         $c.MidText  = ('中 ' + $midN + ' 项 ' + (Format-Size $midS))
         $c.HighText = ('高 ' + $highN + ' 项 ' + (Format-Size $highS))
@@ -3899,7 +4048,7 @@ function Invoke-SelfTest {
         $fpBad = Get-MxFileFingerprint -Path $tmpFp -MaskValue $fpMask
         Check '内容被追加必须检出' ($fpBad -ne $sealedNow) '追加内容后指纹没有变化'
     } finally {
-        try { Remove-Item -LiteralPath $tmpFp -Force } catch { }
+        try { Remove-Item -LiteralPath $tmpFp -Force -ErrorAction SilentlyContinue } catch { }
     }
 
     Write-Host ''
@@ -3986,9 +4135,43 @@ function Invoke-SelfTest {
         } else {
             Check '联结点测试（本机不支持建链则跳过）' $true ''
         }
+
+        # 回归用例：联结点作为**清理目标本体**时，必须先解析真实落点再校验。
+        # 这是 v1.5.4 的真实漏洞——目标本身是联结点时，Get-ChildItem -LiteralPath 会
+        # 枚举到链外目录的内容并逐个删掉，等于以管理员身份删任意目录。
+        # 靶子用一个「临时加入保护树」的临时目录：即使守卫失效，最坏也只是丢掉这个
+        # 临时目录里的一个测试文件，绝不会真的碰到系统目录。
+        $outerDest = Join-Path $env:TEMP ('dc_selftest_outer_' + [guid]::NewGuid().ToString('N'))
+        $linkRoot  = Join-Path $env:TEMP ('dc_selftest_linkroot_' + [guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path $outerDest -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $outerDest 'must_survive.dat'), 's')
+            $linkMade = $false
+            try {
+                $null = New-Item -ItemType Junction -Path $linkRoot -Target $outerDest -ErrorAction Stop
+                $linkMade = (Test-Path -LiteralPath (Join-Path $linkRoot 'must_survive.dat'))
+            } catch { $linkMade = $false }
+            if ($linkMade) {
+                # 把靶子临时设成受保护树：解析出的真实落点会因此被 Test-SafePath 拒绝
+                $script:ProtectedTrees = @($script:ProtectedTrees) + @($outerDest)
+                $rr = Remove-PathPermanent -Path $linkRoot -KeepRoot
+                Check '清理目标是联结点时按真实落点校验并拒绝' ((-not $rr.Ok) -and (Test-Path -LiteralPath (Join-Path $outerDest 'must_survive.dat'))) '链外目标目录的内容被删掉了（严重缺陷）'
+                Check '被拒绝时联结点本身也保留' (Test-Path -LiteralPath $linkRoot) '拒绝之后仍把链接摘掉了'
+                $script:ProtectedTrees = @($script:ProtectedTrees | Where-Object { $_ -ine $outerDest })
+                # 反向用例：真实落点合法（同样在临时目录里）时应正常清空、并保留联结点本身
+                $rr2 = Remove-PathPermanent -Path $linkRoot -KeepRoot
+                Check '真实落点合法时联结点按重定向正常清理' ($rr2.Ok -and (-not (Test-Path -LiteralPath (Join-Path $outerDest 'must_survive.dat')))) ('未按预期清理：' + $rr2.Msg)
+            } else {
+                Check '清理目标为联结点的用例（本机不支持建链则跳过）' $true ''
+            }
+        } catch {
+            Check '清理目标为联结点的用例不应抛异常' $false $_.Exception.Message
+        }
+        try { [System.IO.Directory]::Delete($linkRoot, $false) } catch { }
+        try { [System.IO.Directory]::Delete($outerDest, $true) } catch { }
         try { [System.IO.File]::SetAttributes($guardRO, [System.IO.FileAttributes]::Normal) } catch { }
-        try { Remove-Item -LiteralPath $dest -Recurse -Force } catch { }
-        try { Remove-Item -LiteralPath $linkDir -Recurse -Force } catch { }
+        try { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Item -LiteralPath $linkDir -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     } catch {
         Check '嵌套目录测试' $false $_.Exception.Message
     }
@@ -4122,6 +4305,9 @@ Initialize-Entries -Config $cfg
 
 if ($SelfTest) {
     Invoke-SelfTest
+    # 失败必须反映到退出码：否则这条自检无法当作脚本 / CI 的门禁，而它恰好是唯一能
+    # 发现「改过脚本却没重新封装」「密钥混进发行包」的机制。成功仍然是 0。
+    if ($script:stFail -gt 0) { exit 1 }
     exit 0
 }
 
